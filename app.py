@@ -65,25 +65,38 @@ def init_session():
         st.session_state.sm = None
     if "config" not in st.session_state:
         st.session_state.config = {}
+    if "usuario" not in st.session_state:
+        st.session_state.usuario = None
     # Auto-conectar desde Streamlit Secrets (cuando está en la nube)
     if st.session_state.sm is None:
         try:
             if "gcp_service_account" in st.secrets:
-                creds_dict = {k: v for k, v in st.secrets["gcp_service_account"].items()}
+                creds_dict = dict(st.secrets["gcp_service_account"])
                 sm = SheetsManager(creds_dict)
+                sm.ensure_usuarios_sheet()
                 st.session_state.sm = sm
                 st.session_state.config = sm.get_config()
         except Exception:
-            pass  # Sin secrets configurados, usa pantalla de login
+            pass
 
 
 def get_sm() -> SheetsManager | None:
     return st.session_state.get("sm")
 
 
+def get_usuario() -> dict | None:
+    return st.session_state.get("usuario")
+
+
+def es_admin() -> bool:
+    u = get_usuario()
+    return u is not None and u.get("rol") == "admin"
+
+
 def conectar_sheets(creds_dict: dict):
     try:
         sm = SheetsManager(creds_dict)
+        sm.ensure_usuarios_sheet()
         st.session_state.sm = sm
         st.session_state.config = sm.get_config()
         return True
@@ -138,14 +151,62 @@ def pantalla_login():
             """)
 
 
+# ── Pantalla de login de empleado ─────────────────────────────────────────────
+def pantalla_login_empleado():
+    col_center = st.columns([1, 2, 1])[1]
+    with col_center:
+        st.image("https://www.quski.ec/wp-content/uploads/2022/08/logo-quski.png",
+                 width=180, use_container_width=False)
+    st.markdown("<h2 style='text-align:center'>Sistema de Asistencia RRHH</h2>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align:center;color:#6B7280'>Ingresa con tu usuario y contraseña</p>",
+                unsafe_allow_html=True)
+    st.divider()
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("form_login_emp"):
+            id_input = st.text_input("👤 ID de empleado (o 'admin')", placeholder="Ej: 301")
+            pwd_input = st.text_input("🔑 Contraseña", type="password")
+            submitted = st.form_submit_button("Ingresar", type="primary", use_container_width=True)
+
+        if submitted:
+            if not id_input or not pwd_input:
+                st.error("Ingresa tu ID y contraseña.")
+            else:
+                sm = get_sm()
+                resultado = sm.verificar_credenciales(id_input, pwd_input)
+                if resultado is None:
+                    st.error("❌ ID o contraseña incorrectos.")
+                else:
+                    # Buscar nombre del empleado
+                    nombre = "Administrador"
+                    if resultado["id_empleado"] != "admin":
+                        df_emp = sm.get_empleados()
+                        if not df_emp.empty:
+                            mask = df_emp["ID_Empleado"].astype(str) == resultado["id_empleado"]
+                            if mask.any():
+                                nombre = df_emp[mask].iloc[0]["Nombre"]
+                    resultado["nombre"] = nombre
+                    st.session_state.usuario = resultado
+                    st.rerun()
+
+        st.caption("¿Olvidaste tu contraseña? Contacta a RRHH.")
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 def sidebar():
+    usuario = get_usuario()
     with st.sidebar:
         st.markdown("## 🏢 Quski RRHH")
         st.markdown("---")
-        page = st.selectbox(
-            "Módulo",
-            options=[
+        if usuario:
+            st.markdown(f"👤 **{usuario['nombre']}**")
+            rol_label = "🔑 Administrador" if usuario.get("rol") == "admin" else "👔 Empleado"
+            st.caption(rol_label)
+            st.markdown("---")
+
+        if es_admin():
+            options = [
                 "🏠  Dashboard",
                 "👥  Empleados",
                 "✅  Asistencia",
@@ -153,13 +214,22 @@ def sidebar():
                 "🏖️  Vacaciones",
                 "⏰  Horas Extras",
                 "⚙️  Configuración",
-            ],
-            label_visibility="collapsed",
-        )
+                "🔐  Gestión Usuarios",
+            ]
+        else:
+            options = [
+                "✅  Mi Asistencia",
+                "📋  Mis Permisos",
+                "🏖️  Mis Vacaciones",
+                "⏰  Mis Horas Extra",
+                "🔑  Cambiar Contraseña",
+            ]
+
+        page = st.selectbox("Módulo", options=options, label_visibility="collapsed")
         st.markdown("---")
         st.caption(f"📅 {date.today().strftime('%d/%m/%Y')}")
         if st.button("🔒 Cerrar sesión", use_container_width=True):
-            st.session_state.sm = None
+            st.session_state.usuario = None
             st.rerun()
     return page.split("  ")[-1].strip()
 
@@ -361,11 +431,25 @@ def page_empleados():
 def page_asistencia():
     sm = get_sm()
     config = st.session_state.config
-    st.title("✅ Asistencia")
-    tab1, tab2, tab3, tab4 = st.tabs(["⬆️ Registrar entrada", "⬇️ Registrar salida", "📊 Historial", "❌ Marcar ausencia"])
+    usuario = get_usuario()
+    admin = es_admin()
+    st.title("✅ Asistencia" if admin else "✅ Mi Asistencia")
+
+    tabs = ["⬆️ Registrar entrada", "⬇️ Registrar salida", "📊 Historial"]
+    if admin:
+        tabs.append("❌ Marcar ausencia")
+    tab_list = st.tabs(tabs)
+    tab1, tab2, tab3 = tab_list[0], tab_list[1], tab_list[2]
+    tab4 = tab_list[3] if admin else None
 
     df_emp = sm.get_empleados()
     hoy = date.today().strftime("%Y-%m-%d")
+
+    # Filtrar empleados según rol
+    if not admin and usuario:
+        df_emp_fil = df_emp[df_emp["ID_Empleado"].astype(str) == usuario["id_empleado"]] if not df_emp.empty else df_emp
+    else:
+        df_emp_fil = df_emp
 
     def emp_opciones(df):
         if df.empty: return {}
@@ -374,12 +458,16 @@ def page_asistencia():
 
     with tab1:
         st.subheader(f"Registrar entrada – {date.today().strftime('%d/%m/%Y')}")
-        opciones = emp_opciones(df_emp)
+        opciones = emp_opciones(df_emp_fil)
         if not opciones:
             st.warning("No hay empleados registrados.")
         else:
-            sel = st.selectbox("Empleado", list(opciones.keys()), key="entrada_emp")
-            emp_id, nombre = opciones[sel]
+            if admin:
+                sel = st.selectbox("Empleado", list(opciones.keys()), key="entrada_emp")
+                emp_id, nombre = opciones[sel]
+            else:
+                emp_id, nombre = list(opciones.values())[0]
+                st.info(f"👤 Registrando asistencia para: **{nombre}**")
             hora = st.time_input("Hora de entrada", value=datetime.now().time(), key="hora_entrada")
 
             if st.button("📌 Registrar entrada", type="primary"):
@@ -395,12 +483,16 @@ def page_asistencia():
 
     with tab2:
         st.subheader("Registrar salida")
-        opciones = emp_opciones(df_emp)
+        opciones = emp_opciones(df_emp_fil)
         if not opciones:
             st.warning("No hay empleados registrados.")
         else:
-            sel = st.selectbox("Empleado", list(opciones.keys()), key="salida_emp")
-            emp_id, nombre = opciones[sel]
+            if admin:
+                sel = st.selectbox("Empleado", list(opciones.keys()), key="salida_emp")
+                emp_id, nombre = opciones[sel]
+            else:
+                emp_id, nombre = list(opciones.values())[0]
+                st.info(f"👤 Registrando salida para: **{nombre}**")
             fecha_sal = st.date_input("Fecha", date.today(), key="fecha_salida")
             hora_sal  = st.time_input("Hora de salida", value=datetime.now().time(), key="hora_salida")
             obs       = st.text_input("Observaciones (opcional)", key="obs_salida")
@@ -429,7 +521,10 @@ def page_asistencia():
             df_filtro = df_asis[mask].copy()
             df_filtro["Fecha"] = df_filtro["Fecha"].dt.strftime("%Y-%m-%d")
 
-            if not df_emp.empty and "ID_Empleado" in df_filtro.columns:
+            # Empleados solo ven su propio historial
+            if not admin and usuario:
+                df_filtro = df_filtro[df_filtro["ID_Empleado"].astype(str) == usuario["id_empleado"]]
+            elif admin and not df_emp.empty and "ID_Empleado" in df_filtro.columns:
                 emp_fil = st.selectbox("Filtrar empleado", ["Todos"] +
                           [f"{r['ID_Empleado']} – {r['Nombre']}" for _, r in df_emp.iterrows()], key="hist_emp")
                 if emp_fil != "Todos":
@@ -441,8 +536,6 @@ def page_asistencia():
             else:
                 st.dataframe(df_filtro, use_container_width=True, hide_index=True)
                 st.caption(f"{len(df_filtro)} registro(s)")
-
-                # Resumen
                 st.markdown("**Resumen del período**")
                 rc1, rc2, rc3 = st.columns(3)
                 with rc1: st.metric("Total registros", len(df_filtro))
@@ -451,20 +544,21 @@ def page_asistencia():
         else:
             st.info("No hay registros de asistencia.")
 
-    with tab4:
-        st.subheader("Marcar ausencia")
-        opciones = emp_opciones(df_emp)
-        if not opciones:
-            st.warning("No hay empleados registrados.")
-        else:
-            sel = st.selectbox("Empleado", list(opciones.keys()), key="aus_emp")
-            emp_id, nombre = opciones[sel]
-            fecha_aus = st.date_input("Fecha de ausencia", date.today())
-            motivo_aus = st.text_area("Motivo de ausencia")
-            if st.button("📌 Registrar ausencia", type="primary"):
-                with st.spinner("Registrando…"):
-                    sm.marcar_ausencia(emp_id, nombre, fecha_aus.strftime("%Y-%m-%d"), motivo_aus)
-                st.success(f"✅ Ausencia registrada para **{nombre}**")
+    if tab4:
+        with tab4:
+            st.subheader("Marcar ausencia")
+            opciones = emp_opciones(df_emp)
+            if not opciones:
+                st.warning("No hay empleados registrados.")
+            else:
+                sel = st.selectbox("Empleado", list(opciones.keys()), key="aus_emp")
+                emp_id, nombre = opciones[sel]
+                fecha_aus = st.date_input("Fecha de ausencia", date.today())
+                motivo_aus = st.text_area("Motivo de ausencia")
+                if st.button("📌 Registrar ausencia", type="primary"):
+                    with st.spinner("Registrando…"):
+                        sm.marcar_ausencia(emp_id, nombre, fecha_aus.strftime("%Y-%m-%d"), motivo_aus)
+                    st.success(f"✅ Ausencia registrada para **{nombre}**")
 
 
 # ── Módulo: Permisos ──────────────────────────────────────────────────────────
@@ -701,6 +795,293 @@ def page_configuracion():
             st.success("✅ Configuración guardada")
 
 
+# ── Módulo: Gestión de Usuarios (solo admin) ──────────────────────────────────
+def page_gestion_usuarios():
+    sm = get_sm()
+    st.title("🔐 Gestión de Usuarios")
+    st.info("Aquí puedes crear o resetear contraseñas para cada empleado.")
+
+    df_emp = sm.get_empleados()
+    df_usr = sm.get_usuarios()
+
+    tab1, tab2 = st.tabs(["➕ Crear / Resetear contraseña", "📋 Lista de usuarios"])
+
+    with tab1:
+        opciones_emp = {}
+        if not df_emp.empty:
+            opciones_emp = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
+                            for _, r in df_emp.iterrows()}
+        opciones_emp["admin – Administrador RRHH"] = "admin"
+
+        with st.form("form_crear_usuario", clear_on_submit=True):
+            sel = st.selectbox("Empleado", list(opciones_emp.keys()))
+            emp_id = opciones_emp[sel]
+            nueva_pwd = st.text_input("Nueva contraseña", type="password",
+                                      help="Mínimo 6 caracteres")
+            confirmar = st.text_input("Confirmar contraseña", type="password")
+            rol = st.selectbox("Rol", ["empleado", "admin"])
+
+            if st.form_submit_button("💾 Guardar", type="primary"):
+                if len(nueva_pwd) < 6:
+                    st.error("La contraseña debe tener al menos 6 caracteres.")
+                elif nueva_pwd != confirmar:
+                    st.error("Las contraseñas no coinciden.")
+                else:
+                    with st.spinner("Guardando…"):
+                        sm.crear_usuario(emp_id, nueva_pwd, rol)
+                    st.success(f"✅ Usuario **{emp_id}** configurado correctamente.")
+
+    with tab2:
+        if df_usr.empty:
+            st.info("No hay usuarios creados aún.")
+        else:
+            # Mostrar sin el hash de contraseña
+            df_show = df_usr[["ID_Empleado", "Rol"]].copy() if "Password_Hash" in df_usr.columns else df_usr
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
+            st.caption(f"{len(df_usr)} usuario(s) registrado(s)")
+
+
+# ── Módulo: Cambiar Contraseña (empleado) ─────────────────────────────────────
+def page_cambiar_password():
+    sm = get_sm()
+    usuario = get_usuario()
+    st.title("🔑 Cambiar Contraseña")
+
+    with st.form("form_cambiar_pwd", clear_on_submit=True):
+        st.info(f"Cambiando contraseña para: **{usuario['nombre']}** (ID: {usuario['id_empleado']})")
+        pwd_actual  = st.text_input("Contraseña actual", type="password")
+        pwd_nueva   = st.text_input("Nueva contraseña", type="password")
+        pwd_confirm = st.text_input("Confirmar nueva contraseña", type="password")
+
+        if st.form_submit_button("🔒 Cambiar contraseña", type="primary"):
+            if not sm.verificar_credenciales(usuario["id_empleado"], pwd_actual):
+                st.error("❌ La contraseña actual es incorrecta.")
+            elif len(pwd_nueva) < 6:
+                st.error("La nueva contraseña debe tener al menos 6 caracteres.")
+            elif pwd_nueva != pwd_confirm:
+                st.error("Las contraseñas nuevas no coinciden.")
+            else:
+                with st.spinner("Cambiando…"):
+                    sm.cambiar_password(usuario["id_empleado"], pwd_nueva)
+                st.success("✅ Contraseña cambiada exitosamente.")
+
+
+# ── Módulo: Permisos (con restricción por rol) ────────────────────────────────
+def _page_permisos_con_rol():
+    sm = get_sm()
+    config = st.session_state.config
+    usuario = get_usuario()
+    admin = es_admin()
+    st.title("📋 Permisos" if admin else "📋 Mis Permisos")
+    tab1, tab2 = st.tabs(["➕ Solicitar permiso", "📋 Ver permisos"])
+
+    df_emp = sm.get_empleados()
+    limite = float(config.get("Horas_Permiso_Mensual", 3))
+
+    with tab1:
+        st.info(f"ℹ️ Límite mensual: **{limite} horas por empleado**")
+        if admin:
+            opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
+                        for _, r in df_emp.iterrows()} if not df_emp.empty else {}
+        else:
+            # Solo su propio empleado
+            opciones = {}
+            if not df_emp.empty and usuario:
+                mask = df_emp["ID_Empleado"].astype(str) == usuario["id_empleado"]
+                for _, r in df_emp[mask].iterrows():
+                    opciones[f"{r['ID_Empleado']} – {r['Nombre']}"] = str(r["ID_Empleado"])
+
+        if not opciones:
+            st.warning("No hay empleados registrados.")
+        else:
+            with st.form("form_permiso", clear_on_submit=True):
+                if admin:
+                    sel = st.selectbox("Empleado", list(opciones.keys()))
+                    emp_id = opciones[sel]
+                else:
+                    emp_id = list(opciones.values())[0]
+                    st.info(f"👤 Solicitud para: **{list(opciones.keys())[0]}**")
+                fecha_p  = st.date_input("Fecha del permiso", date.today())
+                horas_p  = st.number_input("Horas solicitadas", min_value=0.5, max_value=8.0, step=0.5, value=1.0)
+                motivo_p = st.text_area("Motivo *")
+                año_mes  = fecha_p.strftime("%Y-%m")
+                usadas   = sm.horas_permiso_usadas_mes(emp_id, año_mes)
+                disponibles = max(0, limite - usadas)
+                st.caption(f"Horas usadas: **{usadas:.1f}h** | Disponibles: **{disponibles:.1f}h**")
+                if st.form_submit_button("📤 Enviar solicitud", type="primary"):
+                    if not motivo_p.strip():
+                        st.error("El motivo es obligatorio.")
+                    else:
+                        with st.spinner("Enviando…"):
+                            estado = sm.solicitar_permiso(emp_id, fecha_p.strftime("%Y-%m-%d"), horas_p, motivo_p, config)
+                        st.success(f"✅ Permiso solicitado – Estado: **{estado}**")
+
+    with tab2:
+        df_p = sm.get_permisos()
+        if not admin and usuario and not df_p.empty:
+            df_p = df_p[df_p["ID_Empleado"].astype(str) == usuario["id_empleado"]]
+        if df_p.empty:
+            st.info("No hay solicitudes de permisos.")
+        else:
+            filtro_est = st.selectbox("Filtrar por estado", ["Todos", "Pendiente_Aprobacion", "Aprobado"])
+            df_pf = df_p if filtro_est == "Todos" else df_p[df_p["Estado"].astype(str) == filtro_est]
+            st.dataframe(df_pf, use_container_width=True, hide_index=True)
+            if admin:
+                st.subheader("✅ Aprobar permiso")
+                pend = df_p[df_p["Estado"].astype(str) == "Pendiente_Aprobacion"]
+                if not pend.empty:
+                    perm_sel = st.selectbox("Permiso a aprobar",
+                        pend.apply(lambda r: f"{r['ID_Permiso']} – {r['ID_Empleado']} – {r['Fecha']}", axis=1).tolist())
+                    perm_id  = perm_sel.split(" – ")[0]
+                    aprobador = st.text_input("Aprobado por")
+                    if st.button("✅ Aprobar", type="primary"):
+                        if aprobador.strip():
+                            sm.aprobar_permiso(perm_id, aprobador)
+                            st.success(f"✅ Permiso **{perm_id}** aprobado")
+                            st.rerun()
+                        else:
+                            st.error("Ingresa quién aprueba.")
+
+
+# ── Módulo: Vacaciones (con restricción por rol) ──────────────────────────────
+def _page_vacaciones_con_rol():
+    sm = get_sm()
+    usuario = get_usuario()
+    admin = es_admin()
+    st.title("🏖️ Vacaciones" if admin else "🏖️ Mis Vacaciones")
+    tab1, tab2 = st.tabs(["➕ Solicitar", "📋 Ver"])
+
+    df_emp = sm.get_empleados()
+    if admin:
+        opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
+                    for _, r in df_emp.iterrows()} if not df_emp.empty else {}
+    else:
+        opciones = {}
+        if not df_emp.empty and usuario:
+            mask = df_emp["ID_Empleado"].astype(str) == usuario["id_empleado"]
+            for _, r in df_emp[mask].iterrows():
+                opciones[f"{r['ID_Empleado']} – {r['Nombre']}"] = str(r["ID_Empleado"])
+
+    with tab1:
+        if not opciones:
+            st.warning("No hay empleados registrados.")
+        else:
+            with st.form("form_vac", clear_on_submit=True):
+                if admin:
+                    sel = st.selectbox("Empleado", list(opciones.keys()))
+                    emp_id = opciones[sel]
+                else:
+                    emp_id = list(opciones.values())[0]
+                    st.info(f"👤 Solicitud para: **{list(opciones.keys())[0]}**")
+                c1, c2 = st.columns(2)
+                with c1: fecha_ini = st.date_input("Fecha de inicio")
+                with c2: fecha_fin = st.date_input("Fecha de fin")
+                if fecha_fin >= fecha_ini:
+                    dias = sm.dias_habiles(fecha_ini.strftime("%Y-%m-%d"), fecha_fin.strftime("%Y-%m-%d"))
+                    st.caption(f"📆 Días hábiles: **{dias}**")
+                if st.form_submit_button("📤 Solicitar", type="primary"):
+                    if fecha_fin < fecha_ini:
+                        st.error("La fecha de fin debe ser posterior.")
+                    else:
+                        with st.spinner("Enviando…"):
+                            vac_id = sm.solicitar_vacaciones(emp_id, fecha_ini.strftime("%Y-%m-%d"), fecha_fin.strftime("%Y-%m-%d"))
+                        st.success(f"✅ Vacaciones solicitadas: **{vac_id}** – Estado: Pendiente")
+
+    with tab2:
+        df_v = sm.get_vacaciones()
+        if not admin and usuario and not df_v.empty:
+            df_v = df_v[df_v["ID_Empleado"].astype(str) == usuario["id_empleado"]]
+        if df_v.empty:
+            st.info("No hay solicitudes de vacaciones.")
+        else:
+            filtro_v = st.selectbox("Filtrar", ["Todos", "Pendiente", "Aprobado"])
+            df_vf = df_v if filtro_v == "Todos" else df_v[df_v["Estado"].astype(str) == filtro_v]
+            st.dataframe(df_vf, use_container_width=True, hide_index=True)
+            if admin:
+                st.subheader("✅ Aprobar vacaciones")
+                pend_v = df_v[df_v["Estado"].astype(str) == "Pendiente"]
+                if not pend_v.empty:
+                    vac_sel = st.selectbox("Solicitud a aprobar",
+                        pend_v.apply(lambda r: f"{r['ID_Vacacion']} – {r['ID_Empleado']} ({r['Fecha_Inicio']} → {r['Fecha_Fin']})", axis=1).tolist())
+                    vac_id_ap = vac_sel.split(" – ")[0]
+                    aprobador_v = st.text_input("Aprobado por")
+                    if st.button("✅ Aprobar vacaciones", type="primary"):
+                        if aprobador_v.strip():
+                            sm.aprobar_vacaciones(vac_id_ap, aprobador_v)
+                            st.success(f"✅ Vacaciones **{vac_id_ap}** aprobadas")
+                            st.rerun()
+                        else:
+                            st.error("Ingresa quién aprueba.")
+
+
+# ── Módulo: Horas Extras (con restricción por rol) ────────────────────────────
+def _page_horas_extras_con_rol():
+    sm = get_sm()
+    usuario = get_usuario()
+    admin = es_admin()
+    st.title("⏰ Horas Extras" if admin else "⏰ Mis Horas Extra")
+    tab1, tab2 = st.tabs(["➕ Registrar", "📋 Ver"])
+
+    df_emp = sm.get_empleados()
+    if admin:
+        opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
+                    for _, r in df_emp.iterrows()} if not df_emp.empty else {}
+    else:
+        opciones = {}
+        if not df_emp.empty and usuario:
+            mask = df_emp["ID_Empleado"].astype(str) == usuario["id_empleado"]
+            for _, r in df_emp[mask].iterrows():
+                opciones[f"{r['ID_Empleado']} – {r['Nombre']}"] = str(r["ID_Empleado"])
+
+    with tab1:
+        if not opciones:
+            st.warning("No hay empleados registrados.")
+        else:
+            with st.form("form_hex", clear_on_submit=True):
+                if admin:
+                    sel = st.selectbox("Empleado", list(opciones.keys()))
+                    emp_id = opciones[sel]
+                else:
+                    emp_id = list(opciones.values())[0]
+                    st.info(f"👤 Registrando para: **{list(opciones.keys())[0]}**")
+                fecha_hex = st.date_input("Fecha", date.today())
+                horas_hex = st.number_input("Horas extra", min_value=0.5, max_value=12.0, step=0.5, value=1.0)
+                motivo_hex = st.text_area("Motivo / justificación *")
+                if st.form_submit_button("💾 Registrar", type="primary"):
+                    if not motivo_hex.strip():
+                        st.error("El motivo es obligatorio.")
+                    else:
+                        with st.spinner("Registrando…"):
+                            sm.registrar_horas_extra(emp_id, fecha_hex.strftime("%Y-%m-%d"), horas_hex, motivo_hex)
+                        st.success("✅ Horas extra registradas para aprobación")
+
+    with tab2:
+        df_he = sm.get_horas_extras()
+        if not admin and usuario and not df_he.empty:
+            df_he = df_he[df_he["ID_Empleado"].astype(str) == usuario["id_empleado"]]
+        if df_he.empty:
+            st.info("No hay registros de horas extra.")
+        else:
+            filtro_he = st.selectbox("Filtrar", ["Todos", "Pendiente", "Aprobado"])
+            df_hef = df_he if filtro_he == "Todos" else df_he[df_he["Estado"].astype(str) == filtro_he]
+            st.dataframe(df_hef, use_container_width=True, hide_index=True)
+            if admin:
+                st.subheader("✅ Aprobar horas extra")
+                pend_he = df_he[df_he["Estado"].astype(str) == "Pendiente"]
+                if not pend_he.empty:
+                    hex_sel = st.selectbox("Registro a aprobar",
+                        pend_he.apply(lambda r: f"{r['ID']} – {r['ID_Empleado']} – {r['Fecha']} ({r['Horas_Extra']}h)", axis=1).tolist())
+                    hex_id = hex_sel.split(" – ")[0]
+                    aprobador_he = st.text_input("Aprobado por")
+                    if st.button("✅ Aprobar", type="primary"):
+                        if aprobador_he.strip():
+                            sm.aprobar_hora_extra(hex_id, aprobador_he)
+                            st.success(f"✅ Horas extra **{hex_id}** aprobadas")
+                            st.rerun()
+                        else:
+                            st.error("Ingresa quién aprueba.")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     init_session()
@@ -709,17 +1090,31 @@ def main():
         pantalla_login()
         return
 
+    if get_usuario() is None:
+        pantalla_login_empleado()
+        return
+
     page = sidebar()
 
-    pages = {
-        "Dashboard":      page_dashboard,
-        "Empleados":      page_empleados,
-        "Asistencia":     page_asistencia,
-        "Permisos":       page_permisos,
-        "Vacaciones":     page_vacaciones,
-        "Horas Extras":   page_horas_extras,
-        "Configuración":  page_configuracion,
-    }
+    if es_admin():
+        pages = {
+            "Dashboard":         page_dashboard,
+            "Empleados":         page_empleados,
+            "Asistencia":        page_asistencia,
+            "Permisos":          _page_permisos_con_rol,
+            "Vacaciones":        _page_vacaciones_con_rol,
+            "Horas Extras":      _page_horas_extras_con_rol,
+            "Configuración":     page_configuracion,
+            "Gestión Usuarios":  page_gestion_usuarios,
+        }
+    else:
+        pages = {
+            "Mi Asistencia":     page_asistencia,
+            "Mis Permisos":      _page_permisos_con_rol,
+            "Mis Vacaciones":    _page_vacaciones_con_rol,
+            "Mis Horas Extra":   _page_horas_extras_con_rol,
+            "Cambiar Contraseña": page_cambiar_password,
+        }
 
     fn = pages.get(page)
     if fn:

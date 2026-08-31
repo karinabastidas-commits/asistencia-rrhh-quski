@@ -24,6 +24,7 @@ HEADERS = {
     "Vacaciones":   ["ID_Vacacion", "ID_Empleado", "Fecha_Inicio", "Fecha_Fin", "Dias_Habiles", "Estado", "Aprobado_Por"],
     "Horas_Extras": ["ID", "Fecha", "ID_Empleado", "Horas_Extra", "Motivo", "Aprobado_Por", "Estado"],
     "Configuracion":["Key", "Valor"],
+    "Usuarios":     ["ID_Empleado", "Password_Hash", "Rol"],
 }
 
 CONFIG_DEFAULTS = {
@@ -279,6 +280,60 @@ class SheetsManager:
         next_n = int(nums.max()) + 1 if not nums.empty else 1
         hex_id = f"HE{next_n:04d}"
         self.append("Horas_Extras", [hex_id, fecha, id_empleado, horas, motivo, "", "Pendiente"])
+
+    # ── Usuarios / Autenticación ──────────────────────────────────────────────
+
+    def ensure_usuarios_sheet(self):
+        """Crea la hoja Usuarios si no existe y agrega usuario admin por defecto."""
+        import hashlib
+        try:
+            self._sheet("Usuarios")
+        except Exception:
+            ws = self.spreadsheet.add_worksheet(title="Usuarios", rows=200, cols=3)
+            ws.update("A1:C1", [["ID_Empleado", "Password_Hash", "Rol"]])
+            # Crear admin por defecto: ID=admin, password=Quski2026
+            pwd_hash = hashlib.sha256("Quski2026".encode()).hexdigest()
+            ws.append_row(["admin", pwd_hash, "admin"], value_input_option="USER_ENTERED")
+
+    def get_usuarios(self) -> pd.DataFrame:
+        return self.get_df("Usuarios")
+
+    def verificar_credenciales(self, id_empleado: str, password: str):
+        """Verifica ID + contraseña. Devuelve dict {id_empleado, rol} o None."""
+        import hashlib
+        df = self.get_usuarios()
+        if df.empty or "ID_Empleado" not in df.columns:
+            return None
+        mask = df["ID_Empleado"].astype(str).str.strip() == str(id_empleado).strip()
+        rows = df[mask]
+        if rows.empty:
+            return None
+        row = rows.iloc[0]
+        pwd_hash = hashlib.sha256(password.encode()).hexdigest()
+        if str(row["Password_Hash"]).strip() == pwd_hash:
+            return {"id_empleado": str(id_empleado).strip(), "rol": str(row.get("Rol", "empleado")).strip()}
+        return None
+
+    def crear_usuario(self, id_empleado: str, password: str, rol: str = "empleado"):
+        import hashlib
+        pwd_hash = hashlib.sha256(password.encode()).hexdigest()
+        df = self.get_usuarios()
+        ids = df["ID_Empleado"].astype(str).str.strip().tolist() if not df.empty else []
+        if str(id_empleado) in ids:
+            row_idx = ids.index(str(id_empleado)) + 2
+            self.update_row("Usuarios", row_idx, [id_empleado, pwd_hash, rol])
+        else:
+            self.append("Usuarios", [id_empleado, pwd_hash, rol])
+
+    def cambiar_password(self, id_empleado: str, nueva_password: str):
+        import hashlib
+        pwd_hash = hashlib.sha256(nueva_password.encode()).hexdigest()
+        df = self.get_usuarios()
+        ids = df["ID_Empleado"].astype(str).str.strip().tolist()
+        if str(id_empleado) not in ids:
+            raise ValueError("Usuario no encontrado")
+        row_idx = ids.index(str(id_empleado)) + 2
+        self.update_cell("Usuarios", row_idx, 2, pwd_hash)
 
     def aprobar_hora_extra(self, hex_id: str, aprobado_por: str):
         df = self.get_horas_extras()

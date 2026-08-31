@@ -65,6 +65,16 @@ def init_session():
         st.session_state.sm = None
     if "config" not in st.session_state:
         st.session_state.config = {}
+    # Auto-conectar desde Streamlit Secrets (cuando está en la nube)
+    if st.session_state.sm is None:
+        try:
+            if "gcp_service_account" in st.secrets:
+                creds_dict = {k: v for k, v in st.secrets["gcp_service_account"].items()}
+                sm = SheetsManager(creds_dict)
+                st.session_state.sm = sm
+                st.session_state.config = sm.get_config()
+        except Exception:
+            pass  # Sin secrets configurados, usa pantalla de login
 
 
 def get_sm() -> SheetsManager | None:

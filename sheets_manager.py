@@ -24,16 +24,20 @@ HEADERS = {
     "Vacaciones":   ["ID_Vacacion", "ID_Empleado", "Fecha_Inicio", "Fecha_Fin", "Dias_Habiles", "Estado", "Aprobado_Por"],
     "Horas_Extras": ["ID", "Fecha", "ID_Empleado", "Horas_Extra", "Motivo", "Aprobado_Por", "Estado"],
     "Configuracion":["Key", "Valor"],
-    "Usuarios":     ["ID_Empleado", "Password_Hash", "Rol"],
+    "Usuarios":          ["ID_Empleado", "Password_Hash", "Rol"],
+    "Llamados_Atencion": ["ID_Llamado", "Fecha", "ID_Empleado", "Nombre", "Tipo", "Motivo", "Atrasos_Acumulados", "Registrado_Por", "Estado"],
 }
 
 CONFIG_DEFAULTS = {
-    "Horario_Inicio":         "09:00",
-    "Horario_Fin":            "17:30",
-    "Tolerancia_Minutos":     "0",
-    "Horas_Permiso_Mensual":  "3",
-    "Email_RRHH":             "rrhh@quski.ec",
-    "Zona_Horaria":           "America/Guayaquil",
+    "Horario_Inicio":              "09:00",
+    "Horario_Fin":                 "17:30",
+    "Tolerancia_Minutos":          "0",
+    "Horas_Permiso_Mensual":       "3",
+    "Email_RRHH":                  "rrhh@quski.ec",
+    "Zona_Horaria":                "America/Guayaquil",
+    "Tardanzas_Llamado_Verbal":    "3",
+    "Tardanzas_Llamado_Escrito":   "5",
+    "Tardanzas_Suspension":        "8",
 }
 
 
@@ -100,7 +104,13 @@ class SheetsManager:
         df = self.get_df("Configuracion")
         if df.empty or "Key" not in df.columns:
             return CONFIG_DEFAULTS.copy()
-        cfg = dict(zip(df["Key"].astype(str), df["Valor"].astype(str)))
+        cfg = {}
+        for _, row in df.iterrows():
+            k = str(row["Key"]).strip()
+            v = str(row["Valor"]).strip() if row["Valor"] is not None else ""
+            # Skip blank, "nan", or "None" values so CONFIG_DEFAULTS take precedence
+            if k and k not in ("nan", "None") and v and v not in ("nan", "None"):
+                cfg[k] = v
         return {**CONFIG_DEFAULTS, **cfg}
 
     def set_config(self, key: str, valor: str):
@@ -334,6 +344,62 @@ class SheetsManager:
             raise ValueError("Usuario no encontrado")
         row_idx = ids.index(str(id_empleado)) + 2
         self.update_cell("Usuarios", row_idx, 2, pwd_hash)
+
+    # ── Llamados de Atención ─────────────────────────────────────────────────
+
+    def ensure_llamados_sheet(self):
+        """Crea la hoja Llamados_Atencion si no existe."""
+        try:
+            self._sheet("Llamados_Atencion")
+        except Exception:
+            ws = self.spreadsheet.add_worksheet(title="Llamados_Atencion", rows=500, cols=9)
+            ws.update("A1:I1", [["ID_Llamado", "Fecha", "ID_Empleado", "Nombre", "Tipo",
+                                  "Motivo", "Atrasos_Acumulados", "Registrado_Por", "Estado"]])
+
+    def get_llamados_atencion(self) -> pd.DataFrame:
+        return self.get_df("Llamados_Atencion")
+
+    def get_tardanzas_mes(self, id_empleado: str, año_mes: str) -> int:
+        df = self.get_df("Asistencia")
+        if df.empty or "ID_Empleado" not in df.columns:
+            return 0
+        mask = (df["ID_Empleado"].astype(str) == str(id_empleado)) & \
+               (df["Fecha"].astype(str).str.startswith(año_mes)) & \
+               (df["Estado"].astype(str) == "Tardanza")
+        return int(len(df[mask]))
+
+    def registrar_llamado_atencion(self, id_empleado: str, nombre: str, tipo: str,
+                                    motivo: str, atrasos: int, registrado_por: str) -> str:
+        año = date.today().year
+        df = self.get_llamados_atencion()
+        # Numeración por año: LA-2026-0001
+        if not df.empty and "ID_Llamado" in df.columns:
+            este_año = df[df["ID_Llamado"].astype(str).str.startswith(f"LA-{año}-")]
+            nums = pd.to_numeric(
+                este_año["ID_Llamado"].astype(str).str.extract(r"-(\d+)$")[0],
+                errors="coerce"
+            ).dropna()
+            next_n = int(nums.max()) + 1 if not nums.empty else 1
+        else:
+            next_n = 1
+        llamado_id = f"LA-{año}-{next_n:04d}"
+        fecha = date.today().strftime("%Y-%m-%d")
+        self.append("Llamados_Atencion",
+                    [llamado_id, fecha, id_empleado, nombre, tipo, motivo, atrasos, registrado_por, "Activo"])
+        return llamado_id
+
+    # ── Utilidades de email ───────────────────────────────────────────────────
+
+    def get_email_empleado(self, id_empleado: str) -> str:
+        """Devuelve el email del empleado o cadena vacía si no se encuentra."""
+        df = self.get_empleados()
+        if df.empty or "ID_Empleado" not in df.columns:
+            return ""
+        mask = df["ID_Empleado"].astype(str) == str(id_empleado)
+        rows = df[mask]
+        if rows.empty:
+            return ""
+        return str(rows.iloc[0].get("Email", ""))
 
     def aprobar_hora_extra(self, hex_id: str, aprobado_por: str):
         df = self.get_horas_extras()

@@ -115,7 +115,10 @@ class SheetsManager:
 
     def set_config(self, key: str, valor: str):
         df = self.get_df("Configuracion")
-        keys = df["Key"].astype(str).tolist() if not df.empty else []
+        if not df.empty and "Key" in df.columns:
+            keys = df["Key"].astype(str).tolist()
+        else:
+            keys = []
         if key in keys:
             row_idx = keys.index(key) + 2  # +1 header, +1 base-1
             self.update_row("Configuracion", row_idx, [key, valor])

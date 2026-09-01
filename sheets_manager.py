@@ -113,7 +113,40 @@ class SheetsManager:
                 cfg[k] = v
         return {**CONFIG_DEFAULTS, **cfg}
 
+    def save_all_config(self, config: dict):
+        """Guarda toda la configuración de una vez: limpia la hoja y escribe
+        la fila de encabezado + todas las claves/valores.  Más robusto que
+        llamar a set_config N veces porque garantiza que A1 siempre sea el
+        encabezado correcto y no quedan filas huérfanas."""
+        sheet = self._sheet("Configuracion")
+        rows = [["Key", "Valor"]] + [[k, str(v)] for k, v in config.items()]
+        # Limpiar y reescribir toda la hoja en una sola operación
+        sheet.clear()
+        result = sheet.update(f"A1:B{len(rows)}", rows, value_input_option="USER_ENTERED")
+        # Verificar que se escribieron todas las filas esperadas
+        updated = (result or {}).get("updatedRows", 0)
+        if updated and updated < len(rows):
+            raise RuntimeError(
+                f"Escritura incompleta: se esperaban {len(rows)} filas, "
+                f"Google Sheets reportó {updated}."
+            )
+
     def set_config(self, key: str, valor: str):
+        """Guarda o actualiza una sola clave de configuración.
+        Garantiza que la hoja tenga encabezado Key/Valor en la fila 1."""
+        # Asegurar que la hoja tenga encabezados correctos
+        sheet = self._sheet("Configuracion")
+        all_values = sheet.get_all_values()
+        if not all_values:
+            # Hoja vacía: escribir encabezado primero
+            sheet.update("A1:B1", [["Key", "Valor"]], value_input_option="USER_ENTERED")
+            all_values = [["Key", "Valor"]]
+        elif [str(v).strip() for v in all_values[0]] != ["Key", "Valor"]:
+            # Primera fila no es el encabezado correcto: insertar encabezado
+            sheet.insert_row(["Key", "Valor"], 1, value_input_option="USER_ENTERED")
+            all_values = [["Key", "Valor"]] + all_values
+
+        # Ahora leer el DataFrame con encabezados correctos
         df = self.get_df("Configuracion")
         if not df.empty and "Key" in df.columns:
             keys = df["Key"].astype(str).tolist()

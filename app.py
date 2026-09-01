@@ -8,7 +8,7 @@ import streamlit as st
 import pandas as pd
 import json
 from datetime import date, datetime
-from sheets_manager import SheetsManager
+from sheets_manager import SheetsManager, CONFIG_DEFAULTS
 
 # ── Configuración de página ───────────────────────────────────────────────────
 st.set_page_config(
@@ -932,10 +932,16 @@ def page_configuracion():
                 "Tardanzas_Suspension":        str(tard_suspension),
             }
             with st.spinner("Guardando…"):
-                for k, v in updates.items():
-                    sm.set_config(k, v)
-                st.session_state.config = sm.get_config()
-            st.success("✅ Configuración guardada")
+                try:
+                    sm.save_all_config(updates)
+                    # Actualizar session_state directamente con lo que acabamos
+                    # de guardar — NO re-leer de Sheets para evitar el delay de
+                    # propagación de la API que devuelve datos viejos.
+                    st.session_state.config = {**CONFIG_DEFAULTS, **updates}
+                    st.success("✅ Configuración guardada")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error al guardar: {e}")
 
     # ── Diagnóstico de email ──────────────────────────────────────────────────
     st.divider()

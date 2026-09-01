@@ -110,6 +110,8 @@ def enviar_notificacion_email(destinatario: str, asunto: str, cuerpo_html: str,
     </div></body></html>"""
     msg.attach(MIMEText(html, "html"))
 
+    # Intento 1: STARTTLS en puerto 587 (o el configurado)
+    err_587 = None
     try:
         with smtplib.SMTP(smtp_server, smtp_port, timeout=15) as server:
             server.ehlo()
@@ -119,22 +121,43 @@ def enviar_notificacion_email(destinatario: str, asunto: str, cuerpo_html: str,
             server.sendmail(smtp_user, destinatario, msg.as_string())
         return _ok()
     except smtplib.SMTPAuthenticationError as e:
+        # Error de credenciales — no tiene sentido reintentar con otro puerto
+        detail = e.smtp_error.decode() if isinstance(e.smtp_error, bytes) else str(e.smtp_error)
         return _fail(
-            f"❌ Error de autenticación SMTP (código {e.smtp_code}): {e.smtp_error.decode() if isinstance(e.smtp_error, bytes) else e.smtp_error}\n\n"
-            "Verifica que smtp_user sea el correo completo (ej. rrhh@empresa.com) "
-            "y que smtp_password sea una **Contraseña de Aplicación** de Google (16 caracteres sin espacios)."
+            f"❌ Error de autenticación SMTP (código {e.smtp_code}): {detail}\n\n"
+            "Solución: genera una Contraseña de Aplicación en https://myaccount.google.com/apppasswords "
+            "(requiere verificación en 2 pasos activa) y pon esos 16 caracteres en smtp_password."
         )
-    except smtplib.SMTPConnectError as e:
-        return _fail(f"❌ No se pudo conectar a {smtp_server}:{smtp_port} — {e}")
-    except smtplib.SMTPException as e:
-        return _fail(f"❌ Error SMTP: {type(e).__name__}: {e}")
-    except OSError as e:
+    except Exception as e_first:
+        err_587 = f"{type(e_first).__name__}: {e_first}"
+
+    # Intento 2: SSL directo en puerto 465 (algunos proveedores lo requieren)
+    import ssl as _ssl
+    try:
+        ctx = _ssl.create_default_context()
+        with smtplib.SMTP_SSL(smtp_server, 465, context=ctx, timeout=15) as server:
+            server.login(smtp_user, smtp_password)
+            server.sendmail(smtp_user, destinatario, msg.as_string())
+        return _ok()
+    except smtplib.SMTPAuthenticationError as e:
+        detail = e.smtp_error.decode() if isinstance(e.smtp_error, bytes) else str(e.smtp_error)
         return _fail(
-            f"❌ Error de red: {e}\n\n"
-            "Streamlit Cloud puede bloquear el puerto 587. Prueba con smtp_port=465 y usa SMTP_SSL."
+            f"❌ Error de autenticación (intentos 587 y 465):\n"
+            f"  Puerto 587: {err_587}\n"
+            f"  Puerto 465 (SSL): {detail}\n\n"
+            "Solución: genera una Contraseña de Aplicación en https://myaccount.google.com/apppasswords "
+            "(requiere verificación en 2 pasos activa) y pon esos 16 caracteres en smtp_password."
         )
-    except Exception as e:
-        return _fail(f"❌ Error inesperado ({type(e).__name__}): {e}\n{traceback.format_exc()}")
+    except Exception as e_second:
+        return _fail(
+            f"❌ No se pudo conectar por SMTP (probé ambos puertos):\n"
+            f"  Puerto {smtp_port} (STARTTLS): {err_587}\n"
+            f"  Puerto 465 (SSL): {type(e_second).__name__}: {e_second}\n\n"
+            "Posibles causas:\n"
+            "1. Streamlit Cloud bloquea SMTP saliente (raro, pero ocurre).\n"
+            "2. El smtp_server no es correcto para este dominio.\n"
+            "3. Problemas de red transitoria — intenta de nuevo en unos minutos."
+        )
 
 
 # ── Gestión de sesión y credenciales ─────────────────────────────────────────

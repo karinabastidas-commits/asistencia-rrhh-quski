@@ -60,42 +60,81 @@ h1, h2, h3 { color: var(--quski-blue); }
 
 
 # ── Email helper ──────────────────────────────────────────────────────────────
-def enviar_notificacion_email(destinatario: str, asunto: str, cuerpo_html: str) -> bool:
-    """Envía notificación por email via SMTP. Retorna True si éxito."""
+def enviar_notificacion_email(destinatario: str, asunto: str, cuerpo_html: str,
+                              _return_error: bool = False):
+    """Envía notificación por email via SMTP.
+    Retorna True si éxito, False si falla.
+    Si _return_error=True, retorna (bool, str) con el mensaje de error."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    import traceback
+
+    def _fail(msg):
+        return (False, msg) if _return_error else False
+
+    def _ok():
+        return (True, "") if _return_error else True
+
+    if "email" not in st.secrets:
+        return _fail("❌ No existe la sección [email] en los Secrets de Streamlit.")
+
+    cfg = st.secrets["email"]
+    smtp_server   = cfg.get("smtp_server", "smtp.gmail.com")
+    smtp_port_raw = cfg.get("smtp_port", "587")
+    smtp_user     = cfg.get("smtp_user", "")
+    smtp_password = cfg.get("smtp_password", "")
+
     try:
-        import smtplib
-        from email.mime.text import MIMEText
-        from email.mime.multipart import MIMEMultipart
-        if "email" not in st.secrets:
-            return False
-        cfg = st.secrets["email"]
-        smtp_server = cfg.get("smtp_server", "smtp.gmail.com")
-        smtp_port = int(cfg.get("smtp_port", 587))
-        smtp_user = cfg.get("smtp_user", "")
-        smtp_password = cfg.get("smtp_password", "")
-        if not smtp_user or not smtp_password:
-            return False
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Quski RRHH – {asunto}"
-        msg["From"] = smtp_user
-        msg["To"] = destinatario
-        html = f"""<html><body style="font-family:Arial,sans-serif;padding:24px;background:#f4f6f8">
-        <div style="max-width:520px;margin:auto;background:white;border-radius:8px;
-                    border-left:4px solid #00A99D;padding:28px">
-          <h2 style="color:#1A3A5C;margin-top:0">{asunto}</h2>
-          {cuerpo_html}
-          <hr style="margin:24px 0;border:none;border-top:1px solid #eee">
-          <p style="color:#999;font-size:12px">Sistema de Asistencia RRHH – Quski<br>
-          Este es un mensaje automático, no responder a este correo.</p>
-        </div></body></html>"""
-        msg.attach(MIMEText(html, "html"))
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
+        smtp_port = int(smtp_port_raw)
+    except (ValueError, TypeError):
+        return _fail(f"❌ smtp_port inválido: '{smtp_port_raw}'. Debe ser un número (ej. 587).")
+
+    if not smtp_user:
+        return _fail("❌ smtp_user está vacío en los Secrets.")
+    if not smtp_password:
+        return _fail("❌ smtp_password está vacío en los Secrets.")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"Quski RRHH – {asunto}"
+    msg["From"]    = smtp_user
+    msg["To"]      = destinatario
+    html = f"""<html><body style="font-family:Arial,sans-serif;padding:24px;background:#f4f6f8">
+    <div style="max-width:520px;margin:auto;background:white;border-radius:8px;
+                border-left:4px solid #00A99D;padding:28px">
+      <h2 style="color:#1A3A5C;margin-top:0">{asunto}</h2>
+      {cuerpo_html}
+      <hr style="margin:24px 0;border:none;border-top:1px solid #eee">
+      <p style="color:#999;font-size:12px">Sistema de Asistencia RRHH – Quski<br>
+      Este es un mensaje automático, no responder a este correo.</p>
+    </div></body></html>"""
+    msg.attach(MIMEText(html, "html"))
+
+    try:
+        with smtplib.SMTP(smtp_server, smtp_port, timeout=15) as server:
+            server.ehlo()
             server.starttls()
+            server.ehlo()
             server.login(smtp_user, smtp_password)
             server.sendmail(smtp_user, destinatario, msg.as_string())
-        return True
-    except Exception:
-        return False
+        return _ok()
+    except smtplib.SMTPAuthenticationError as e:
+        return _fail(
+            f"❌ Error de autenticación SMTP (código {e.smtp_code}): {e.smtp_error.decode() if isinstance(e.smtp_error, bytes) else e.smtp_error}\n\n"
+            "Verifica que smtp_user sea el correo completo (ej. rrhh@empresa.com) "
+            "y que smtp_password sea una **Contraseña de Aplicación** de Google (16 caracteres sin espacios)."
+        )
+    except smtplib.SMTPConnectError as e:
+        return _fail(f"❌ No se pudo conectar a {smtp_server}:{smtp_port} — {e}")
+    except smtplib.SMTPException as e:
+        return _fail(f"❌ Error SMTP: {type(e).__name__}: {e}")
+    except OSError as e:
+        return _fail(
+            f"❌ Error de red: {e}\n\n"
+            "Streamlit Cloud puede bloquear el puerto 587. Prueba con smtp_port=465 y usa SMTP_SSL."
+        )
+    except Exception as e:
+        return _fail(f"❌ Error inesperado ({type(e).__name__}): {e}\n{traceback.format_exc()}")
 
 
 # ── Gestión de sesión y credenciales ─────────────────────────────────────────
@@ -874,6 +913,67 @@ def page_configuracion():
                     sm.set_config(k, v)
                 st.session_state.config = sm.get_config()
             st.success("✅ Configuración guardada")
+
+    # ── Diagnóstico de email ──────────────────────────────────────────────────
+    st.divider()
+    st.subheader("🧪 Diagnóstico de Email")
+    st.caption("Envía un correo de prueba para verificar que la configuración SMTP funciona correctamente.")
+
+    # Mostrar estado actual de los Secrets
+    with st.expander("🔍 Ver estado actual de la configuración SMTP (Secrets)", expanded=False):
+        if "email" not in st.secrets:
+            st.error("❌ **No existe** la sección `[email]` en los Secrets de Streamlit.")
+            st.code("""# Agrega esto en Streamlit Cloud → App settings → Secrets:
+[email]
+smtp_server   = "smtp.gmail.com"
+smtp_port     = "587"
+smtp_user     = "tu_correo@gmail.com"
+smtp_password = "xxxx xxxx xxxx xxxx"   # Contraseña de Aplicación (16 chars)""", language="toml")
+        else:
+            cfg_e = st.secrets["email"]
+            st.success("✅ Sección `[email]` encontrada en Secrets.")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write(f"**smtp_server:** `{cfg_e.get('smtp_server', '(no definido)')}`")
+                st.write(f"**smtp_port:** `{cfg_e.get('smtp_port', '(no definido)')}`")
+            with c2:
+                u = cfg_e.get("smtp_user", "")
+                st.write(f"**smtp_user:** `{u if u else '(vacío)'}`")
+                p = cfg_e.get("smtp_password", "")
+                p_disp = ("*" * min(len(p), 8) + f" ({len(p)} caracteres)") if p else "(vacío)"
+                st.write(f"**smtp_password:** `{p_disp}`")
+                if p and len(p) < 14:
+                    st.warning("⚠️ La contraseña parece muy corta. Una Contraseña de Aplicación de Google tiene 16 caracteres (puede escribirse con o sin espacios).")
+                elif p and len(p.replace(" ", "")) != 16:
+                    st.warning(f"⚠️ Sin espacios son {len(p.replace(' ', ''))} caracteres. Las Contraseñas de Aplicación de Google tienen exactamente 16 caracteres sin espacios.")
+
+    dest_prueba = st.text_input(
+        "Destino del correo de prueba",
+        value=config.get("Email_RRHH", ""),
+        help="Email donde quieres recibir el correo de prueba"
+    )
+    if st.button("📨 Enviar correo de prueba", type="secondary", use_container_width=True):
+        if not dest_prueba:
+            st.warning("Escribe un email de destino primero.")
+        else:
+            with st.spinner("Enviando…"):
+                ok, err = enviar_notificacion_email(
+                    dest_prueba,
+                    "Correo de prueba",
+                    "<p>Este es un correo de prueba enviado desde el Sistema de Asistencia RRHH – Quski.</p>"
+                    "<p>Si recibes este mensaje, la configuración SMTP funciona correctamente. ✅</p>",
+                    _return_error=True
+                )
+            if ok:
+                st.success(f"✅ Correo enviado exitosamente a **{dest_prueba}**. ¡Revisa tu bandeja de entrada!")
+            else:
+                st.error("**Error al enviar el correo:**")
+                st.code(err, language=None)
+                st.info(
+                    "**Solución más común:** La Contraseña de Aplicación de Google se genera en "
+                    "[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). "
+                    "Asegúrate de que la verificación en dos pasos esté activada en tu cuenta Gmail."
+                )
 
 
 # ── Módulo: Gestión de Usuarios (solo admin) ──────────────────────────────────

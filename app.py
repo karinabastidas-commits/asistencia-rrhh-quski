@@ -19,6 +19,22 @@ from sheets_manager import (
 MAX_INTENTOS_LOGIN = 5          # intentos fallidos antes de bloquear
 BLOQUEO_SEGUNDOS   = 300        # 5 minutos de espera tras agotarlos
 
+
+def leer_secrets(seccion: str):
+    """Devuelve una sección de los Secrets de Streamlit, o None si no existe.
+
+    Hay que envolverlo: cuando no hay ningún archivo secrets.toml —el caso
+    normal al ejecutar la app en un equipo local— `st.secrets` no se comporta
+    como un diccionario vacío, sino que lanza StreamlitSecretNotFoundError.
+    Sin esto, la app se cae en lugar de avisar que falta la configuración.
+    """
+    try:
+        if seccion in st.secrets:
+            return st.secrets[seccion]
+    except Exception:
+        return None
+    return None
+
 # ── Configuración de página ───────────────────────────────────────────────────
 st.set_page_config(
     page_title="Asistencia RRHH – Quski",
@@ -85,10 +101,12 @@ def enviar_notificacion_email(destinatario: str, asunto: str, cuerpo_html: str,
     def _ok():
         return (True, "") if _return_error else True
 
-    if "email" not in st.secrets:
-        return _fail("❌ No existe la sección [email] en los Secrets de Streamlit.")
+    cfg = leer_secrets("email")
+    if cfg is None:
+        return _fail("❌ No hay configuración de correo. Falta la sección [email] "
+                     "en los Secrets de Streamlit (o el archivo .streamlit/secrets.toml "
+                     "si estás ejecutando la app en tu equipo).")
 
-    cfg = st.secrets["email"]
     smtp_server   = cfg.get("smtp_server", "smtp.gmail.com")
     smtp_port_raw = cfg.get("smtp_port", "587")
     smtp_user     = cfg.get("smtp_user", "")
@@ -180,8 +198,9 @@ def init_session():
     # Auto-conectar desde Streamlit Secrets (cuando está en la nube)
     if st.session_state.sm is None:
         try:
-            if "gcp_service_account" in st.secrets:
-                creds_dict = dict(st.secrets["gcp_service_account"])
+            cuenta = leer_secrets("gcp_service_account")
+            if cuenta is not None:
+                creds_dict = dict(cuenta)
                 sm = SheetsManager(creds_dict)
                 sm.ensure_usuarios_sheet()
                 sm.ensure_llamados_sheet()
@@ -951,16 +970,22 @@ def page_configuracion():
 
     # Mostrar estado actual de los Secrets
     with st.expander("🔍 Ver estado actual de la configuración SMTP (Secrets)", expanded=False):
-        if "email" not in st.secrets:
-            st.error("❌ **No existe** la sección `[email]` en los Secrets de Streamlit.")
-            st.code("""# Agrega esto en Streamlit Cloud → App settings → Secrets:
-[email]
+        cfg_e = leer_secrets("email")
+        if cfg_e is None:
+            st.error("❌ **No hay configuración de correo.**")
+            st.markdown(
+                "- **En Streamlit Cloud:** *Manage app → Settings → Secrets*.\n"
+                "- **En tu equipo:** crea el archivo `.streamlit/secrets.toml` "
+                "dentro de la carpeta del proyecto.\n\n"
+                "En ambos casos el contenido es el mismo:")
+            st.code("""[email]
 smtp_server   = "smtp.gmail.com"
 smtp_port     = "587"
-smtp_user     = "tu_correo@gmail.com"
-smtp_password = "xxxx xxxx xxxx xxxx"   # Contraseña de Aplicación (16 chars)""", language="toml")
+smtp_user     = "tu_correo@quski.ec"
+smtp_password = "xxxx xxxx xxxx xxxx"   # Contraseña de Aplicación (16 caracteres)""",
+                    language="toml")
+            st.caption("⚠️ Nunca subas secrets.toml a GitHub: agrégalo al archivo .gitignore.")
         else:
-            cfg_e = st.secrets["email"]
             st.success("✅ Sección `[email]` encontrada en Secrets.")
             c1, c2 = st.columns(2)
             with c1:

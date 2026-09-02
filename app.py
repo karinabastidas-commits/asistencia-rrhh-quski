@@ -533,10 +533,10 @@ def pantalla_login_empleado():
 
         if submitted:
             bloqueado_hasta = st.session_state.get("login_bloqueado_hasta")
-            ahora = ahora()
+            momento = ahora()
 
-            if bloqueado_hasta and ahora < bloqueado_hasta:
-                restante = int((bloqueado_hasta - ahora).total_seconds())
+            if bloqueado_hasta and momento < bloqueado_hasta:
+                restante = int((bloqueado_hasta - momento).total_seconds())
                 st.error(f"🔒 Demasiados intentos fallidos. Espera {restante} segundos "
                          "antes de volver a intentar.")
             elif not id_input or not pwd_input:
@@ -550,7 +550,7 @@ def pantalla_login_empleado():
                     restantes = MAX_INTENTOS_LOGIN - fallidos
                     if restantes <= 0:
                         st.session_state.login_bloqueado_hasta = \
-                            ahora + timedelta(seconds=BLOQUEO_SEGUNDOS)
+                            momento + timedelta(seconds=BLOQUEO_SEGUNDOS)
                         st.session_state.login_fallidos = 0
                         st.error(f"🔒 Demasiados intentos fallidos. "
                                  f"Espera {BLOQUEO_SEGUNDOS // 60} minutos.")
@@ -665,7 +665,7 @@ def df_con_badges(df: pd.DataFrame, col_estado: str = "Estado") -> pd.DataFrame:
 def page_dashboard():
     sm = get_sm()
     st.title("🏠 Dashboard")
-    hoy = hoy().strftime("%Y-%m-%d")
+    hoy_str = hoy().strftime("%Y-%m-%d")
     mes = hoy().strftime("%Y-%m")
 
     try:
@@ -679,7 +679,7 @@ def page_dashboard():
         return
 
     total_emp = len(emp_df)
-    asis_hoy  = len(asis_df[asis_df["Fecha"].astype(str) == hoy]) if not asis_df.empty else 0
+    asis_hoy  = len(asis_df[asis_df["Fecha"].astype(str) == hoy_str]) if not asis_df.empty else 0
     tardanzas_mes = len(asis_df[
         (asis_df["Fecha"].astype(str).str.startswith(mes)) &
         (asis_df["Estado"].astype(str) == "Tardanza")
@@ -689,7 +689,7 @@ def page_dashboard():
 
     col1, col2, col3, col4 = st.columns(4)
     with col1: metric_card("Total empleados", total_emp, "👥")
-    with col2: metric_card("Asistencias hoy", asis_hoy, "✅")
+    with col2: metric_card("Asistencias hoy_str", asis_hoy, "✅")
     with col3: metric_card("Tardanzas en el mes", tardanzas_mes, "⚠️")
     with col4: metric_card("Solicitudes pendientes", pend_permisos + pend_vac, "📋")
 
@@ -697,15 +697,15 @@ def page_dashboard():
     col_a, col_b = st.columns(2)
 
     with col_a:
-        st.subheader("📅 Asistencia de hoy")
-        asis_hoy_df = asis_df[asis_df["Fecha"].astype(str) == hoy] if not asis_df.empty else pd.DataFrame()
+        st.subheader("📅 Asistencia de hoy_str")
+        asis_hoy_df = asis_df[asis_df["Fecha"].astype(str) == hoy_str] if not asis_df.empty else pd.DataFrame()
         if not asis_hoy_df.empty:
             st.dataframe(
                 asis_hoy_df[["ID_Empleado","Nombre","Hora_Entrada","Hora_Salida","Estado","Minutos_Atraso"]],
                 use_container_width=True, hide_index=True
             )
         else:
-            st.info("Sin registros de asistencia hoy.")
+            st.info("Sin registros de asistencia hoy_str.")
 
     with col_b:
         st.subheader("📋 Solicitudes pendientes")
@@ -839,7 +839,7 @@ def page_asistencia():
     tab4 = tab_list[3] if admin else None
 
     df_emp = sm.get_empleados()
-    hoy = hoy().strftime("%Y-%m-%d")
+    hoy_str = hoy().strftime("%Y-%m-%d")
 
     # Filtrar empleados según rol
     if not admin and usuario:
@@ -867,8 +867,8 @@ def page_asistencia():
             hora = st.time_input("Hora de entrada", value=ahora().time(), key="hora_entrada")
 
             if st.button("📌 Registrar entrada", type="primary"):
-                if sm.ya_registro_entrada(emp_id, hoy):
-                    st.warning(f"⚠️ {nombre} ya tiene entrada registrada hoy.")
+                if sm.ya_registro_entrada(emp_id, hoy_str):
+                    st.warning(f"⚠️ {nombre} ya tiene entrada registrada hoy_str.")
                 else:
                     with st.spinner("Registrando…"):
                         estado, atraso = sm.registrar_entrada(emp_id, nombre, hora.strftime("%H:%M"), config)

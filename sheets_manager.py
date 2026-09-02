@@ -64,7 +64,8 @@ HEADERS = {
     "Vacaciones":   ["ID_Vacacion", "ID_Empleado", "Fecha_Inicio", "Fecha_Fin", "Dias_Habiles", "Estado",
                      "Aprobado_Por",
                      "Aprobado_Jefe", "Fecha_Aprob_Jefe", "Aprobado_RRHH", "Fecha_Aprob_RRHH",
-                     "Motivo_Rechazo", "Rechazado_Por", "Dias_Calendario"],
+                     "Motivo_Rechazo", "Rechazado_Por", "Dias_Calendario",
+                     "Motivo", "Reemplazo"],
     "Horas_Extras": ["ID", "Fecha", "ID_Empleado", "Horas_Extra", "Motivo", "Aprobado_Por", "Estado"],
     "Configuracion":["Key", "Valor"],
     "Usuarios":          ["ID_Empleado", "Password_Hash", "Rol"],
@@ -98,6 +99,11 @@ EST_PEND_JEFE = "Pendiente_Jefe"
 EST_PEND_RRHH = "Pendiente_RRHH"
 EST_APROBADO  = "Aprobado"
 EST_RECHAZADO = "Rechazado"
+
+# Tipo reservado para el registro automático de atrasos. Se guarda en la misma
+# hoja de Llamados_Atencion pero NO es una sanción: queda separado de los
+# llamados Verbal / Escrito / Suspensión que emite RRHH a mano.
+TIPO_TARDANZA = "Tardanza (registro automático)"
 
 # Estados que aún cuentan contra el cupo mensual de permisos
 ESTADOS_VIGENTES = {EST_PEND_JEFE.lower(), EST_PEND_RRHH.lower(), EST_APROBADO.lower(),
@@ -797,11 +803,13 @@ class SheetsManager:
             })
         return pd.DataFrame(filas)
 
-    def solicitar_vacaciones(self, id_empleado: str, fecha_ini: str, fecha_fin: str) -> dict:
+    def solicitar_vacaciones(self, id_empleado: str, fecha_ini: str, fecha_fin: str,
+                             motivo: str = "", reemplazo: str = "") -> dict:
         """Crea la solicitud de vacaciones. Requiere aprobación del jefe
         inmediato (si está asignado) y luego de RRHH.
 
-        Devuelve {"id", "estado", "dias", "email_jefe"}.
+        motivo    : razón del pedido, queda registrada en la hoja.
+        reemplazo : quién cubre las funciones durante la ausencia.
         """
         dias = self.dias_habiles(fecha_ini, fecha_fin)
         dias_cal = self.dias_calendario(fecha_ini, fecha_fin)
@@ -810,10 +818,11 @@ class SheetsManager:
 
         vac_id = self._next_id("Vacaciones", "ID_Vacacion", "VAC")
         fila = [vac_id, id_empleado, fecha_ini, fecha_fin, dias, estado,
-                "", "", "", "", "", "", "", dias_cal]
+                "", "", "", "", "", "", "", dias_cal, motivo, reemplazo]
         self.append("Vacaciones", fila)
         return {"id": vac_id, "estado": estado, "dias": dias,
-                "dias_calendario": dias_cal, "email_jefe": email_jefe}
+                "dias_calendario": dias_cal, "email_jefe": email_jefe,
+                "motivo": motivo, "reemplazo": reemplazo}
 
     def aprobar_vacaciones_jefe(self, vac_id: str, aprobador: str):
         row = self._fila_de("Vacaciones", "ID_Vacacion", vac_id)
@@ -965,6 +974,33 @@ class SheetsManager:
                (df["Fecha"].astype(str).str.startswith(año_mes)) & \
                (df["Estado"].astype(str) == "Tardanza")
         return int(len(df[mask]))
+
+    def registrar_tardanza(self, id_empleado: str, nombre: str, hora: str,
+                           minutos: int, atrasos_mes: int) -> str:
+        """Deja constancia de un atraso en la hoja de Llamados de Atención.
+
+        Es un registro informativo, no una sanción: el tipo lo distingue de los
+        llamados que emite RRHH. Sirve para que el atraso quede documentado y
+        contabilizado el día que haya que sustentar un llamado formal.
+        """
+        return self.registrar_llamado_atencion(
+            id_empleado, nombre, TIPO_TARDANZA,
+            f"Entrada registrada a las {hora} con {minutos} minuto(s) de atraso.",
+            atrasos_mes, "Sistema (automático)")
+
+    def llamados_disciplinarios(self) -> pd.DataFrame:
+        """Solo los llamados emitidos por RRHH, sin los registros de tardanza."""
+        df = self.get_llamados_atencion()
+        if df.empty or "Tipo" not in df.columns:
+            return df
+        return df[df["Tipo"].astype(str) != TIPO_TARDANZA]
+
+    def registros_tardanza(self) -> pd.DataFrame:
+        """Solo los registros automáticos de atraso."""
+        df = self.get_llamados_atencion()
+        if df.empty or "Tipo" not in df.columns:
+            return pd.DataFrame(columns=HEADERS["Llamados_Atencion"])
+        return df[df["Tipo"].astype(str) == TIPO_TARDANZA]
 
     def registrar_llamado_atencion(self, id_empleado: str, nombre: str, tipo: str,
                                     motivo: str, atrasos: int, registrado_por: str) -> str:

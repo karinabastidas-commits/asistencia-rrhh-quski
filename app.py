@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 import html as _html
 from sheets_manager import (
     SheetsManager, CONFIG_DEFAULTS, ahora_local, hoy_local,
-    EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO,
+    EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO, TIPO_TARDANZA,
     password_debil,
 )
 
@@ -34,6 +34,66 @@ def leer_secrets(seccion: str):
     except Exception:
         return None
     return None
+
+
+def notificar_tardanza(sm, config, emp_id, nombre, momento, atraso):
+    """Deja constancia del atraso y avisa al jefe inmediato, a RRHH y al empleado.
+
+    Se dispara en CADA tardanza, llegue o no al umbral de un llamado formal, de
+    modo que el atraso quede documentado el mismo día en que ocurre.
+    """
+    mes = momento.strftime("%Y-%m")
+    try:
+        atrasos_mes = sm.get_tardanzas_mes(emp_id, mes)
+    except Exception:
+        atrasos_mes = 0
+
+    llamado_id = ""
+    try:
+        llamado_id = sm.registrar_tardanza(emp_id, nombre, momento.strftime("%H:%M"),
+                                           int(atraso), atrasos_mes)
+    except Exception as e:
+        flash("warning", f"El atraso quedó en Asistencia pero no se pudo dejar "
+                         f"constancia en Llamados de Atención ({e}).")
+
+    # ¿Este atraso alcanza algún umbral de la política disciplinaria?
+    alerta = ""
+    for umbral, etiqueta in ((_cfg_int(config, "Tardanzas_Suspension", 8), "SUSPENSIÓN"),
+                             (_cfg_int(config, "Tardanzas_Llamado_Escrito", 5), "llamado ESCRITO"),
+                             (_cfg_int(config, "Tardanzas_Llamado_Verbal", 3), "llamado VERBAL")):
+        if atrasos_mes >= umbral:
+            alerta = (f"Acumula {atrasos_mes} atraso(s) este mes y alcanza el "
+                      f"umbral de {etiqueta}.")
+            break
+
+    filas = [("Empleado", f"{emp_id} – {nombre}"),
+             ("Fecha", momento.strftime("%d/%m/%Y")),
+             ("Hora de entrada", momento.strftime("%H:%M")),
+             ("Horario establecido", config.get("Horario_Inicio", "09:00")),
+             ("Minutos de atraso", int(atraso)),
+             ("Atrasos acumulados en el mes", atrasos_mes)]
+    if llamado_id:
+        filas.append(("Nº de registro", llamado_id))
+
+    cuerpo = (f"<p>Se registró un <strong>atraso</strong> de "
+              f"<strong>{esc(nombre)}</strong>.</p>" + tabla_html(filas))
+    if alerta:
+        cuerpo += (f"<p style='margin-top:16px;padding:10px;background:#FEF3C7;"
+                   f"border-left:4px solid #D97706'><strong>⚠️ {esc(alerta)}</strong></p>")
+    cuerpo += ("<p style='margin-top:16px;color:#6B7280;font-size:13px'>Registro "
+               "informativo automático. Los llamados de atención formales los emite "
+               "RRHH desde el sistema.</p>")
+
+    enviados, fallidos = notificar(
+        [sm.get_email_jefe(emp_id), config.get("Email_RRHH", ""),
+         sm.get_email_empleado(emp_id)],
+        f"Atraso registrado – {nombre} ({momento.strftime('%d/%m/%Y')})", cuerpo)
+    if enviados:
+        flash("info", "📧 Atraso notificado a: " + ", ".join(enviados))
+    if fallidos:
+        flash("warning", "⚠️ No se pudo avisar del atraso a: " + ", ".join(fallidos))
+    if alerta:
+        flash("warning", "⚠️ " + alerta)
 
 
 def registrar_entrada_automatica():
@@ -71,6 +131,8 @@ def registrar_entrada_automatica():
         if estado == "Tardanza":
             flash("warning", f"⏰ Tu entrada quedó registrada a las "
                              f"{momento.strftime('%H:%M')} — {atraso} minuto(s) de atraso.")
+            notificar_tardanza(sm, st.session_state.config, emp_id,
+                               str(emp.get("Nombre", emp_id)), momento, atraso)
         else:
             flash("success", f"✅ Tu entrada quedó registrada a las "
                              f"{momento.strftime('%H:%M')}. ¡Buen día!")
@@ -969,6 +1031,7 @@ def page_asistencia():
                         flash("warning", f"⏰ Entrada de **{nombre}** registrada a las "
                                          f"{momento.strftime('%H:%M')} — "
                                          f"**{atraso} minuto(s)** de atraso.")
+                        notificar_tardanza(sm, config, emp_id, nombre, momento, atraso)
                     else:
                         flash("success", f"✅ Entrada de **{nombre}** registrada a tiempo, "
                                          f"a las {momento.strftime('%H:%M')}.")
@@ -1332,7 +1395,10 @@ def _datos_solicitud(sm, fila, tipo: str) -> dict:
         "titulo":  f"Vacaciones · {fila.get('Dias_Habiles', '—')} días hábiles",
         "detalle": [("Desde", fila.get("Fecha_Inicio", "—")),
                     ("Hasta", fila.get("Fecha_Fin", "—")),
-                    ("Días hábiles", fila.get("Dias_Habiles", "—"))],
+                    ("Días calendario", fila.get("Dias_Calendario", "—") or "—"),
+                    ("Días hábiles", fila.get("Dias_Habiles", "—")),
+                    ("Motivo", fila.get("Motivo", "") or "—"),
+                    ("Reemplazo", fila.get("Reemplazo", "") or "—")],
         "asunto":  "vacaciones",
     }
 
@@ -1972,13 +2038,16 @@ def _page_vacaciones_con_rol():
                     c1, c2 = st.columns(2)
                     with c1: fecha_ini = st.date_input("Fecha de inicio")
                     with c2: fecha_fin = st.date_input("Fecha de fin")
+                    motivo_v    = st.text_area("Motivo del pedido")
+                    reemplazo_v = st.text_input("¿Quién lo reemplaza?")
                     if st.form_submit_button("📤 Registrar solicitud", type="primary"):
                         if fecha_fin < fecha_ini:
                             st.error("La fecha de fin debe ser posterior a la de inicio.")
                         else:
                             _crear_vacaciones(sm, config, opciones_a[sel],
                                               sel.split(" – ")[-1],
-                                              fecha_ini, fecha_fin, email_rrhh)
+                                              fecha_ini, fecha_fin, email_rrhh,
+                                              motivo_v.strip(), reemplazo_v.strip())
 
     # ── Vista EMPLEADO ───────────────────────────────────────────────────────
     else:
@@ -2009,13 +2078,23 @@ def _page_vacaciones_con_rol():
                     c1, c2 = st.columns(2)
                     with c1: fecha_ini = st.date_input("Fecha de inicio")
                     with c2: fecha_fin = st.date_input("Fecha de fin")
+                    motivo_v = st.text_area(
+                        "Motivo del pedido",
+                        placeholder="Ej: Vacaciones familiares programadas",
+                        help="Queda registrado junto con la solicitud.")
+                    reemplazo_v = st.text_input(
+                        "¿Quién te reemplaza? *",
+                        placeholder="Ej: 402 – Jessica Benavides",
+                        help="Persona que cubre tus funciones mientras no estés.")
                     if st.form_submit_button("📤 Enviar solicitud", type="primary"):
                         if fecha_fin < fecha_ini:
                             st.error("La fecha de fin debe ser posterior a la de inicio.")
                         else:
                             pedidos = sm.dias_calendario(fecha_ini.strftime("%Y-%m-%d"),
                                                          fecha_fin.strftime("%Y-%m-%d"))
-                            if (not saldo["sin_fecha_ingreso"]
+                            if not reemplazo_v.strip():
+                                st.error("Indica quién te va a reemplazar.")
+                            elif (not saldo["sin_fecha_ingreso"]
                                     and pedidos > saldo["disponibles"]):
                                 st.error(
                                     f"❌ Estás pidiendo **{pedidos} días calendario** y "
@@ -2023,7 +2102,8 @@ def _page_vacaciones_con_rol():
                                     "Ajusta las fechas o consulta con RRHH.")
                             else:
                                 _crear_vacaciones(sm, config, emp_id, nombre_emp,
-                                                  fecha_ini, fecha_fin, email_rrhh)
+                                                  fecha_ini, fecha_fin, email_rrhh,
+                                                  motivo_v.strip(), reemplazo_v.strip())
 
         with tab2:
             df_v = sm.get_vacaciones()
@@ -2036,12 +2116,14 @@ def _page_vacaciones_con_rol():
                              use_container_width=True, hide_index=True)
 
 
-def _crear_vacaciones(sm, config, emp_id, nombre_emp, fecha_ini, fecha_fin, email_rrhh):
+def _crear_vacaciones(sm, config, emp_id, nombre_emp, fecha_ini, fecha_fin, email_rrhh,
+                      motivo="", reemplazo=""):
     """Registra las vacaciones y notifica al jefe inmediato y a RRHH."""
     try:
         with st.spinner("Enviando…"):
             res = sm.solicitar_vacaciones(emp_id, fecha_ini.strftime("%Y-%m-%d"),
-                                          fecha_fin.strftime("%Y-%m-%d"))
+                                          fecha_fin.strftime("%Y-%m-%d"),
+                                          motivo, reemplazo)
     except Exception as e:
         st.error(f"❌ No se pudo registrar la solicitud: {e}")
         return
@@ -2052,7 +2134,9 @@ def _crear_vacaciones(sm, config, emp_id, nombre_emp, fecha_ini, fecha_fin, emai
              ("Desde", fecha_ini.strftime("%d/%m/%Y")),
              ("Hasta", fecha_fin.strftime("%d/%m/%Y")),
              ("Días calendario", res.get("dias_calendario", res["dias"])),
-             ("Días hábiles", res["dias"])]
+             ("Días hábiles", res["dias"]),
+             ("Motivo", motivo or "—"),
+             ("Reemplazo durante la ausencia", reemplazo or "—")]
     cuerpo = (f"<p><strong>{esc(nombre_emp)}</strong> ha solicitado vacaciones.</p>"
               + tabla_html(filas)
               + "<p style='margin-top:16px'>Ingresa al sistema para aprobar o rechazar "
@@ -2464,19 +2548,38 @@ def page_llamados_atencion():
                                        "en su ficha, así que no se notificó a ningún jefe.")
 
     with tab3:
-        st.subheader("Historial de Llamados de Atención")
-        if df_llamados.empty:
-            st.info("No hay llamados de atención registrados.")
+        # Se separan los llamados formales que emite RRHH de los registros
+        # automáticos de atraso: viven en la misma hoja pero no son lo mismo.
+        df_disc = df_llamados[df_llamados["Tipo"].astype(str) != TIPO_TARDANZA] \
+            if not df_llamados.empty and "Tipo" in df_llamados.columns else df_llamados
+        df_tard = df_llamados[df_llamados["Tipo"].astype(str) == TIPO_TARDANZA] \
+            if not df_llamados.empty and "Tipo" in df_llamados.columns else pd.DataFrame()
+
+        et_disc = f"⚠️ Llamados formales ({len(df_disc)})"
+        et_tard = f"⏰ Registros de atraso ({len(df_tard)})"
+        vista = secciones([et_disc, et_tard], "sec_hist_llamados")
+        st.divider()
+
+        base = df_disc if vista == et_disc else df_tard
+        if vista == et_tard:
+            st.caption("Cada atraso queda registrado automáticamente aquí y se avisa "
+                       "por correo al jefe inmediato y a RRHH. **No son sanciones**: "
+                       "sirven de respaldo cuando haya que emitir un llamado formal.")
+
+        if base.empty:
+            st.info("No hay registros en esta sección.")
         else:
             c1, c2 = st.columns(2)
             with c1:
                 opciones_f = ["Todos"] + [f"{r['ID_Empleado']} – {r['Nombre']}"
                                            for _, r in df_emp.iterrows()] if not df_emp.empty else ["Todos"]
-                filtro_emp = st.selectbox("Filtrar por empleado", opciones_f)
+                filtro_emp = st.selectbox("Filtrar por empleado", opciones_f,
+                                          key="filtro_emp_hist")
             with c2:
-                filtro_tipo = st.selectbox("Filtrar por tipo", ["Todos", "Verbal", "Escrito", "Suspensión"])
+                tipos = ["Todos"] + sorted(base["Tipo"].astype(str).unique().tolist())
+                filtro_tipo = st.selectbox("Filtrar por tipo", tipos, key="filtro_tipo_hist")
 
-            df_lf = df_llamados.copy()
+            df_lf = base.copy()
             if filtro_emp != "Todos":
                 eid = filtro_emp.split(" – ")[0]
                 df_lf = df_lf[df_lf["ID_Empleado"].astype(str) == eid]
@@ -2484,14 +2587,21 @@ def page_llamados_atencion():
                 df_lf = df_lf[df_lf["Tipo"].astype(str) == filtro_tipo]
 
             st.dataframe(df_lf, use_container_width=True, hide_index=True)
-            st.caption(f"{len(df_lf)} llamado(s) encontrado(s)")
+            st.caption(f"{len(df_lf)} registro(s)")
 
-            # Resumen por empleado
-            if len(df_llamados) > 0:
+            if vista == et_disc and not df_disc.empty:
                 st.divider()
-                st.subheader("Resumen por empleado")
-                resumen_l = df_llamados.groupby(["ID_Empleado", "Nombre"])["Tipo"].value_counts().unstack(fill_value=0)
+                st.subheader("Resumen de llamados formales por empleado")
+                resumen_l = (df_disc.groupby(["ID_Empleado", "Nombre"])["Tipo"]
+                             .value_counts().unstack(fill_value=0))
                 st.dataframe(resumen_l, use_container_width=True)
+            elif vista == et_tard and not df_tard.empty:
+                st.divider()
+                st.subheader("Atrasos por empleado")
+                resumen_t = (df_tard.groupby(["ID_Empleado", "Nombre"])
+                             .size().reset_index(name="Atrasos registrados")
+                             .sort_values("Atrasos registrados", ascending=False))
+                st.dataframe(resumen_t, use_container_width=True, hide_index=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

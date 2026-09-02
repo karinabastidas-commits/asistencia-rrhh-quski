@@ -7,8 +7,17 @@ Aplicativo web con Streamlit + Google Sheets API
 import streamlit as st
 import pandas as pd
 import json
-from datetime import date, datetime
-from sheets_manager import SheetsManager, CONFIG_DEFAULTS
+from datetime import date, datetime, timedelta
+import html as _html
+from sheets_manager import (
+    SheetsManager, CONFIG_DEFAULTS,
+    EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO,
+    password_debil,
+)
+
+# ── Seguridad: control de intentos de inicio de sesión ────────────────────────
+MAX_INTENTOS_LOGIN = 5          # intentos fallidos antes de bloquear
+BLOQUEO_SEGUNDOS   = 300        # 5 minutos de espera tras agotarlos
 
 # ── Configuración de página ───────────────────────────────────────────────────
 st.set_page_config(
@@ -176,10 +185,16 @@ def init_session():
                 sm = SheetsManager(creds_dict)
                 sm.ensure_usuarios_sheet()
                 sm.ensure_llamados_sheet()
+                # Agrega a Permisos y Vacaciones las columnas del flujo de doble
+                # aprobación si la hoja viene de una versión anterior. Es
+                # idempotente y debe correr ANTES de escribir cualquier solicitud.
+                sm.migrar_esquema()
                 st.session_state.sm = sm
                 st.session_state.config = sm.get_config()
-        except Exception:
-            pass
+        except Exception as e:
+            # No se silencia del todo: se guarda para poder mostrarlo en la
+            # pantalla de conexión en lugar de fallar sin explicación.
+            st.session_state.error_conexion = f"{type(e).__name__}: {e}"
 
 
 def get_sm() -> SheetsManager | None:
@@ -195,19 +210,118 @@ def es_admin() -> bool:
     return u is not None and u.get("rol") == "admin"
 
 
+def email_usuario_actual() -> str:
+    """Correo del usuario conectado, tomado de su ficha de empleado."""
+    u = get_usuario()
+    if not u:
+        return ""
+    return str(u.get("email", "")).strip()
+
+
+def es_jefe() -> bool:
+    """True si al menos un empleado tiene a este usuario como jefe inmediato."""
+    u = get_usuario()
+    if not u:
+        return False
+    if "es_jefe" not in u:
+        sm = get_sm()
+        correo = email_usuario_actual()
+        u["es_jefe"] = bool(sm and correo and sm.es_jefe(correo))
+    return bool(u["es_jefe"])
+
+
+def esc(texto) -> str:
+    """Escapa texto antes de incrustarlo en el HTML de un correo.
+
+    Sin esto, un empleado podría escribir etiquetas HTML o enlaces en el campo
+    'Motivo' y esos irían tal cual en el correo que recibe RRHH o el jefe.
+    """
+    return _html.escape(str(texto if texto is not None else ""), quote=True)
+
+
+# ── Notificaciones ────────────────────────────────────────────────────────────
+def tabla_html(filas: list) -> str:
+    """Tabla HTML para el cuerpo de los correos. filas: [(etiqueta, valor), ...].
+    Todos los valores pasan por esc(), así que es seguro incluir texto escrito
+    por el empleado (motivos, observaciones)."""
+    partes = ['<table style="border-collapse:collapse;width:100%;margin-top:12px">']
+    for i, (etiqueta, valor) in enumerate(filas):
+        borde = "" if i == len(filas) - 1 else "border-bottom:1px solid #eee"
+        partes.append(
+            f'<tr><td style="padding:8px 12px;{borde};width:38%"><strong>{esc(etiqueta)}:</strong></td>'
+            f'<td style="padding:8px 12px;{borde}">{esc(valor)}</td></tr>'
+        )
+    partes.append("</table>")
+    return "".join(partes)
+
+
+def notificar(destinatarios, asunto: str, cuerpo_html: str) -> tuple:
+    """Envía el mismo correo a varios destinatarios, sin repetir direcciones.
+    Devuelve (enviados, fallidos)."""
+    enviados, fallidos, vistos = [], [], set()
+    for d in destinatarios:
+        d = str(d or "").strip()
+        if not d or d.lower() in vistos:
+            continue
+        vistos.add(d.lower())
+        try:
+            if enviar_notificacion_email(d, asunto, cuerpo_html):
+                enviados.append(d)
+            else:
+                fallidos.append(d)
+        except Exception:
+            fallidos.append(d)
+    return enviados, fallidos
+
+
+def mostrar_envio(enviados, fallidos):
+    """Muestra en pantalla a quién se notificó y a quién no."""
+    if enviados:
+        st.info("📧 Notificado a: " + ", ".join(enviados))
+    if fallidos:
+        st.warning("⚠️ No se pudo enviar el correo a: " + ", ".join(fallidos)
+                   + " — avísales por otro medio.")
+
+
+def etiqueta_estado(estado) -> str:
+    """Estado legible para el empleado, indicando la etapa exacta del trámite."""
+    e = str(estado).strip()
+    mapa = {
+        EST_PEND_JEFE:          ("⏳", "Esperando aprobación de tu jefe inmediato"),
+        EST_PEND_RRHH:          ("👤", "Aprobado por tu jefe – en revisión de RRHH"),
+        EST_APROBADO:           ("✅", "Aprobado"),
+        EST_RECHAZADO:          ("❌", "Rechazado"),
+        "Pendiente":            ("⏳", "En trámite"),
+        "Pendiente_Aprobacion": ("⏳", "En trámite"),
+    }
+    ico, txt = mapa.get(e, ("•", e or "—"))
+    return f"{ico} {txt}"
+
+
+def etiqueta_estado_corta(estado) -> str:
+    """Versión breve para las tablas de RRHH."""
+    e = str(estado).strip()
+    return {
+        EST_PEND_JEFE: "⏳ Con el jefe",
+        EST_PEND_RRHH: "👤 Con RRHH",
+        EST_APROBADO:  "✅ Aprobado",
+        EST_RECHAZADO: "❌ Rechazado",
+    }.get(e, e or "—")
+
+
 def conectar_sheets(creds_dict: dict):
     try:
         sm = SheetsManager(creds_dict)
         sm.ensure_usuarios_sheet()
+        sm.ensure_llamados_sheet()
+        sm.migrar_esquema()
         st.session_state.sm = sm
         st.session_state.config = sm.get_config()
         return True
     except Exception as e:
-        import traceback
-        detalle = traceback.format_exc()
+        # Se muestra el tipo de error, no la traza completa: esta pantalla es
+        # pública y la traza revela rutas internas y correos de servicio.
         st.error(f"❌ Error al conectar: {type(e).__name__}: {e}")
-        with st.expander("🔍 Detalle técnico del error"):
-            st.code(detalle)
         return False
 
 
@@ -253,6 +367,40 @@ def pantalla_login():
             """)
 
 
+# ── Primer arranque: creación del administrador ──────────────────────────────
+def pantalla_primer_admin():
+    """Se muestra una sola vez, cuando la hoja Usuarios aún no tiene un admin.
+    La persona define su propia contraseña en lugar de heredar una fija."""
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.warning("⚠️ **Primer arranque** – todavía no existe un administrador. "
+                   "Crea la cuenta ahora para asegurar el sistema.")
+        with st.form("form_primer_admin"):
+            nuevo_id = st.text_input("ID del administrador", value="admin",
+                                     help="Puedes dejar 'admin' o usar tu ID de empleado.")
+            p1 = st.text_input("Contraseña nueva", type="password")
+            p2 = st.text_input("Repetir contraseña", type="password")
+            st.caption("Mínimo 8 caracteres, con letras y al menos un número o símbolo.")
+            crear = st.form_submit_button("🔐 Crear administrador", type="primary",
+                                          use_container_width=True)
+        if crear:
+            if not nuevo_id.strip():
+                st.error("Ingresa un ID.")
+            elif p1 != p2:
+                st.error("Las contraseñas no coinciden.")
+            else:
+                problema = password_debil(p1)
+                if problema:
+                    st.error(f"❌ {problema}")
+                else:
+                    try:
+                        get_sm().crear_usuario(nuevo_id.strip(), p1, "admin")
+                        st.success("✅ Administrador creado. Ya puedes iniciar sesión.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ No se pudo crear el usuario: {e}")
+
+
 # ── Pantalla de login de empleado ─────────────────────────────────────────────
 def pantalla_login_empleado():
     col_center = st.columns([1, 2, 1])[1]
@@ -264,6 +412,19 @@ def pantalla_login_empleado():
                 unsafe_allow_html=True)
     st.divider()
 
+    # Primer arranque: si todavía no existe ningún administrador, se pide crear
+    # uno aquí. Antes el sistema creaba solo un admin con contraseña fija escrita
+    # en el código fuente, lo que la dejaba a la vista de cualquiera con acceso
+    # al repositorio.
+    sm_ini = get_sm()
+    try:
+        sin_admin = sm_ini is not None and not sm_ini.hay_admin()
+    except Exception:
+        sin_admin = False
+    if sin_admin:
+        pantalla_primer_admin()
+        return
+
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         with st.form("form_login_emp"):
@@ -272,23 +433,46 @@ def pantalla_login_empleado():
             submitted = st.form_submit_button("Ingresar", type="primary", use_container_width=True)
 
         if submitted:
-            if not id_input or not pwd_input:
+            bloqueado_hasta = st.session_state.get("login_bloqueado_hasta")
+            ahora = datetime.now()
+
+            if bloqueado_hasta and ahora < bloqueado_hasta:
+                restante = int((bloqueado_hasta - ahora).total_seconds())
+                st.error(f"🔒 Demasiados intentos fallidos. Espera {restante} segundos "
+                         "antes de volver a intentar.")
+            elif not id_input or not pwd_input:
                 st.error("Ingresa tu ID y contraseña.")
             else:
                 sm = get_sm()
                 resultado = sm.verificar_credenciales(id_input, pwd_input)
                 if resultado is None:
-                    st.error("❌ ID o contraseña incorrectos.")
+                    fallidos = st.session_state.get("login_fallidos", 0) + 1
+                    st.session_state.login_fallidos = fallidos
+                    restantes = MAX_INTENTOS_LOGIN - fallidos
+                    if restantes <= 0:
+                        st.session_state.login_bloqueado_hasta = \
+                            ahora + timedelta(seconds=BLOQUEO_SEGUNDOS)
+                        st.session_state.login_fallidos = 0
+                        st.error(f"🔒 Demasiados intentos fallidos. "
+                                 f"Espera {BLOQUEO_SEGUNDOS // 60} minutos.")
+                    else:
+                        # Mensaje genérico a propósito: no revela si el ID existe.
+                        st.error(f"❌ ID o contraseña incorrectos. "
+                                 f"Te quedan {restantes} intento(s).")
                 else:
-                    # Buscar nombre del empleado
-                    nombre = "Administrador"
+                    st.session_state.login_fallidos = 0
+                    st.session_state.login_bloqueado_hasta = None
+                    # Datos de la ficha del empleado (nombre y correo)
+                    nombre, correo = "Administrador", ""
                     if resultado["id_empleado"] != "admin":
-                        df_emp = sm.get_empleados()
-                        if not df_emp.empty:
-                            mask = df_emp["ID_Empleado"].astype(str) == resultado["id_empleado"]
-                            if mask.any():
-                                nombre = df_emp[mask].iloc[0]["Nombre"]
+                        emp = sm.get_empleado(resultado["id_empleado"])
+                        if emp:
+                            nombre = str(emp.get("Nombre", resultado["id_empleado"]))
+                            correo = str(emp.get("Email", "")).strip()
+                    else:
+                        correo = st.session_state.config.get("Email_RRHH", "")
                     resultado["nombre"] = nombre
+                    resultado["email"]  = correo
                     st.session_state.usuario = resultado
                     st.rerun()
 
@@ -303,7 +487,12 @@ def sidebar():
         st.markdown("---")
         if usuario:
             st.markdown(f"👤 **{usuario['nombre']}**")
-            rol_label = "🔑 Administrador" if usuario.get("rol") == "admin" else "👔 Empleado"
+            if usuario.get("rol") == "admin":
+                rol_label = "🔑 Administrador"
+            elif es_jefe():
+                rol_label = "✍️ Jefe inmediato"
+            else:
+                rol_label = "👔 Empleado"
             st.caption(rol_label)
             st.markdown("---")
 
@@ -321,8 +510,11 @@ def sidebar():
                 "📁  Expediente",
             ]
         else:
-            options = [
-                "✅  Mi Asistencia",
+            options = ["✅  Mi Asistencia"]
+            # Quien tiene personal a cargo ve primero su bandeja de aprobaciones
+            if es_jefe():
+                options.append("✍️  Aprobaciones")
+            options += [
                 "📋  Mis Permisos",
                 "🏖️  Mis Vacaciones",
                 "⏰  Mis Horas Extra",
@@ -665,197 +857,6 @@ def page_asistencia():
                     st.success(f"✅ Ausencia registrada para **{nombre}**")
 
 
-# ── Módulo: Permisos ──────────────────────────────────────────────────────────
-def page_permisos():
-    sm = get_sm()
-    config = st.session_state.config
-    st.title("📋 Permisos")
-    tab1, tab2 = st.tabs(["➕ Solicitar permiso", "📋 Gestionar permisos"])
-
-    df_emp = sm.get_empleados()
-
-    with tab1:
-        limite = float(config.get("Horas_Permiso_Mensual", 3))
-        st.info(f"ℹ️ Límite mensual de permisos: **{limite} horas por empleado**")
-
-        opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
-                    for _, r in df_emp.iterrows()} if not df_emp.empty else {}
-
-        if not opciones:
-            st.warning("No hay empleados registrados.")
-        else:
-            with st.form("form_permiso", clear_on_submit=True):
-                sel = st.selectbox("Empleado", list(opciones.keys()))
-                emp_id = opciones[sel]
-                fecha_p = st.date_input("Fecha del permiso", date.today())
-                horas_p = st.number_input("Horas solicitadas", min_value=0.5, max_value=8.0, step=0.5, value=1.0)
-                motivo_p = st.text_area("Motivo *")
-
-                año_mes = fecha_p.strftime("%Y-%m")
-                usadas = sm.horas_permiso_usadas_mes(emp_id, año_mes)
-                disponibles = max(0, limite - usadas)
-                st.caption(f"Horas usadas este mes: **{usadas:.1f}h** | Disponibles: **{disponibles:.1f}h**")
-
-                if st.form_submit_button("📤 Enviar solicitud", type="primary"):
-                    if not motivo_p.strip():
-                        st.error("El motivo es obligatorio.")
-                    elif horas_p > disponibles and disponibles < horas_p:
-                        st.warning(f"⚠️ Supera el límite mensual ({disponibles:.1f}h disponibles). Quedará en aprobación RRHH.")
-                        estado = sm.solicitar_permiso(emp_id, fecha_p.strftime("%Y-%m-%d"), horas_p, motivo_p, config)
-                        st.info(f"Solicitud enviada con estado: **{estado}**")
-                    else:
-                        with st.spinner("Enviando…"):
-                            estado = sm.solicitar_permiso(emp_id, fecha_p.strftime("%Y-%m-%d"), horas_p, motivo_p, config)
-                        st.success(f"✅ Permiso solicitado – Estado: **{estado}**")
-
-    with tab2:
-        df_p = sm.get_permisos()
-        if df_p.empty:
-            st.info("No hay solicitudes de permisos.")
-        else:
-            filtro_est = st.selectbox("Filtrar por estado", ["Todos", "Pendiente_Aprobacion", "Aprobado"])
-            df_pf = df_p if filtro_est == "Todos" else df_p[df_p["Estado"].astype(str) == filtro_est]
-            st.dataframe(df_pf, use_container_width=True, hide_index=True)
-
-            st.subheader("✅ Aprobar permiso")
-            pend = df_p[df_p["Estado"].astype(str) == "Pendiente_Aprobacion"]
-            if pend.empty:
-                st.info("No hay permisos pendientes de aprobación.")
-            else:
-                perm_sel = st.selectbox("Permiso a aprobar",
-                    pend.apply(lambda r: f"{r['ID_Permiso']} – {r['ID_Empleado']} – {r['Fecha']}", axis=1).tolist())
-                perm_id = perm_sel.split(" – ")[0]
-                aprobador = st.text_input("Aprobado por (nombre o email)")
-                if st.button("✅ Aprobar", type="primary"):
-                    if not aprobador.strip():
-                        st.error("Ingresa quién aprueba el permiso.")
-                    else:
-                        with st.spinner("Aprobando…"):
-                            sm.aprobar_permiso(perm_id, aprobador)
-                        st.success(f"✅ Permiso **{perm_id}** aprobado")
-                        st.rerun()
-
-
-# ── Módulo: Vacaciones ────────────────────────────────────────────────────────
-def page_vacaciones():
-    sm = get_sm()
-    st.title("🏖️ Vacaciones")
-    tab1, tab2 = st.tabs(["➕ Solicitar vacaciones", "📋 Gestionar vacaciones"])
-
-    df_emp = sm.get_empleados()
-    opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
-                for _, r in df_emp.iterrows()} if not df_emp.empty else {}
-
-    with tab1:
-        if not opciones:
-            st.warning("No hay empleados registrados.")
-        else:
-            with st.form("form_vac", clear_on_submit=True):
-                sel = st.selectbox("Empleado", list(opciones.keys()))
-                emp_id = opciones[sel]
-                c1, c2 = st.columns(2)
-                with c1: fecha_ini = st.date_input("Fecha de inicio")
-                with c2: fecha_fin = st.date_input("Fecha de fin")
-
-                if fecha_fin >= fecha_ini:
-                    dias = sm.dias_habiles(fecha_ini.strftime("%Y-%m-%d"), fecha_fin.strftime("%Y-%m-%d"))
-                    st.caption(f"📆 Días hábiles: **{dias}**")
-
-                if st.form_submit_button("📤 Solicitar vacaciones", type="primary"):
-                    if fecha_fin < fecha_ini:
-                        st.error("La fecha de fin debe ser posterior a la de inicio.")
-                    else:
-                        with st.spinner("Enviando…"):
-                            vac_id = sm.solicitar_vacaciones(
-                                emp_id, fecha_ini.strftime("%Y-%m-%d"), fecha_fin.strftime("%Y-%m-%d")
-                            )
-                        st.success(f"✅ Vacaciones solicitadas: **{vac_id}** – Estado: Pendiente")
-
-    with tab2:
-        df_v = sm.get_vacaciones()
-        if df_v.empty:
-            st.info("No hay solicitudes de vacaciones.")
-        else:
-            filtro_v = st.selectbox("Filtrar por estado", ["Todos", "Pendiente", "Aprobado"])
-            df_vf = df_v if filtro_v == "Todos" else df_v[df_v["Estado"].astype(str) == filtro_v]
-            st.dataframe(df_vf, use_container_width=True, hide_index=True)
-
-            st.subheader("✅ Aprobar vacaciones")
-            pend_v = df_v[df_v["Estado"].astype(str) == "Pendiente"]
-            if pend_v.empty:
-                st.info("No hay vacaciones pendientes.")
-            else:
-                vac_sel = st.selectbox("Solicitud a aprobar",
-                    pend_v.apply(lambda r: f"{r['ID_Vacacion']} – {r['ID_Empleado']} ({r['Fecha_Inicio']} → {r['Fecha_Fin']})", axis=1).tolist())
-                vac_id_ap = vac_sel.split(" – ")[0]
-                aprobador_v = st.text_input("Aprobado por")
-                if st.button("✅ Aprobar vacaciones", type="primary"):
-                    if not aprobador_v.strip():
-                        st.error("Ingresa quién aprueba.")
-                    else:
-                        with st.spinner("Aprobando…"):
-                            sm.aprobar_vacaciones(vac_id_ap, aprobador_v)
-                        st.success(f"✅ Vacaciones **{vac_id_ap}** aprobadas")
-                        st.rerun()
-
-
-# ── Módulo: Horas Extras ──────────────────────────────────────────────────────
-def page_horas_extras():
-    sm = get_sm()
-    st.title("⏰ Horas Extras")
-    tab1, tab2 = st.tabs(["➕ Registrar horas extra", "📋 Gestionar horas extra"])
-
-    df_emp = sm.get_empleados()
-    opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
-                for _, r in df_emp.iterrows()} if not df_emp.empty else {}
-
-    with tab1:
-        if not opciones:
-            st.warning("No hay empleados registrados.")
-        else:
-            with st.form("form_hex", clear_on_submit=True):
-                sel = st.selectbox("Empleado", list(opciones.keys()))
-                emp_id = opciones[sel]
-                fecha_hex = st.date_input("Fecha", date.today())
-                horas_hex = st.number_input("Horas extra trabajadas", min_value=0.5, max_value=12.0, step=0.5, value=1.0)
-                motivo_hex = st.text_area("Motivo / justificación *")
-
-                if st.form_submit_button("💾 Registrar horas extra", type="primary"):
-                    if not motivo_hex.strip():
-                        st.error("El motivo es obligatorio.")
-                    else:
-                        with st.spinner("Registrando…"):
-                            sm.registrar_horas_extra(emp_id, fecha_hex.strftime("%Y-%m-%d"), horas_hex, motivo_hex)
-                        st.success(f"✅ Horas extra registradas para aprobación")
-
-    with tab2:
-        df_he = sm.get_horas_extras()
-        if df_he.empty:
-            st.info("No hay registros de horas extra.")
-        else:
-            filtro_he = st.selectbox("Filtrar por estado", ["Todos", "Pendiente", "Aprobado"])
-            df_hef = df_he if filtro_he == "Todos" else df_he[df_he["Estado"].astype(str) == filtro_he]
-            st.dataframe(df_hef, use_container_width=True, hide_index=True)
-
-            st.subheader("✅ Aprobar horas extra")
-            pend_he = df_he[df_he["Estado"].astype(str) == "Pendiente"]
-            if pend_he.empty:
-                st.info("No hay horas extra pendientes de aprobación.")
-            else:
-                hex_sel = st.selectbox("Registro a aprobar",
-                    pend_he.apply(lambda r: f"{r['ID']} – {r['ID_Empleado']} – {r['Fecha']} ({r['Horas_Extra']}h)", axis=1).tolist())
-                hex_id = hex_sel.split(" – ")[0]
-                aprobador_he = st.text_input("Aprobado por")
-                if st.button("✅ Aprobar", type="primary"):
-                    if not aprobador_he.strip():
-                        st.error("Ingresa quién aprueba.")
-                    else:
-                        with st.spinner("Aprobando…"):
-                            sm.aprobar_hora_extra(hex_id, aprobador_he)
-                        st.success(f"✅ Horas extra **{hex_id}** aprobadas")
-                        st.rerun()
-
-
 # ── Módulo: Configuración ─────────────────────────────────────────────────────
 def _cfg_int(config: dict, key: str, default: int) -> int:
     """Lee un entero del dict de config de forma segura."""
@@ -1027,13 +1028,15 @@ def page_gestion_usuarios():
             sel = st.selectbox("Empleado", list(opciones_emp.keys()))
             emp_id = opciones_emp[sel]
             nueva_pwd = st.text_input("Nueva contraseña", type="password",
-                                      help="Mínimo 6 caracteres")
+                                      help="Mínimo 8 caracteres, con letras y al menos "
+                                           "un número o símbolo.")
             confirmar = st.text_input("Confirmar contraseña", type="password")
             rol = st.selectbox("Rol", ["empleado", "admin"])
 
             if st.form_submit_button("💾 Guardar", type="primary"):
-                if len(nueva_pwd) < 6:
-                    st.error("La contraseña debe tener al menos 6 caracteres.")
+                problema = password_debil(nueva_pwd)
+                if problema:
+                    st.error(f"❌ {problema}")
                 elif nueva_pwd != confirmar:
                     st.error("Las contraseñas no coinciden.")
                 else:
@@ -1064,16 +1067,255 @@ def page_cambiar_password():
         pwd_confirm = st.text_input("Confirmar nueva contraseña", type="password")
 
         if st.form_submit_button("🔒 Cambiar contraseña", type="primary"):
+            problema = password_debil(pwd_nueva)
             if not sm.verificar_credenciales(usuario["id_empleado"], pwd_actual):
                 st.error("❌ La contraseña actual es incorrecta.")
-            elif len(pwd_nueva) < 6:
-                st.error("La nueva contraseña debe tener al menos 6 caracteres.")
+            elif problema:
+                st.error(f"❌ {problema}")
+            elif pwd_nueva == pwd_actual:
+                st.error("La nueva contraseña debe ser distinta de la actual.")
             elif pwd_nueva != pwd_confirm:
                 st.error("Las contraseñas nuevas no coinciden.")
             else:
                 with st.spinner("Cambiando…"):
                     sm.cambiar_password(usuario["id_empleado"], pwd_nueva)
                 st.success("✅ Contraseña cambiada exitosamente.")
+
+
+# ── Tarjetas de aprobación (compartidas por permisos y vacaciones) ────────────
+def _datos_solicitud(sm, fila, tipo: str) -> dict:
+    """Normaliza una fila de Permisos o Vacaciones a una estructura común."""
+    emp_id = str(fila["ID_Empleado"]).strip()
+    nombre = sm.get_nombre_empleado(emp_id)
+    if tipo == "permiso":
+        return {
+            "id":      str(fila["ID_Permiso"]).strip(),
+            "emp_id":  emp_id,
+            "nombre":  nombre,
+            "titulo":  f"Permiso · {fila['Horas_Solicitadas']} h",
+            "detalle": [("Fecha", fila.get("Fecha", "—")),
+                        ("Horas solicitadas", f"{fila.get('Horas_Solicitadas', '—')} h"),
+                        ("Motivo", fila.get("Motivo", "—") or "—")],
+            "asunto":  "permiso",
+        }
+    return {
+        "id":      str(fila["ID_Vacacion"]).strip(),
+        "emp_id":  emp_id,
+        "nombre":  nombre,
+        "titulo":  f"Vacaciones · {fila.get('Dias_Habiles', '—')} días hábiles",
+        "detalle": [("Desde", fila.get("Fecha_Inicio", "—")),
+                    ("Hasta", fila.get("Fecha_Fin", "—")),
+                    ("Días hábiles", fila.get("Dias_Habiles", "—"))],
+        "asunto":  "vacaciones",
+    }
+
+
+def _correos_de(sm, emp_id: str, config: dict) -> tuple:
+    """Devuelve (email_empleado, email_jefe, email_rrhh)."""
+    return (sm.get_email_empleado(emp_id),
+            sm.get_email_jefe(emp_id),
+            config.get("Email_RRHH", ""))
+
+
+def tarjeta_aprobacion(sm, config, fila, tipo: str, etapa: str,
+                       aprobador_default: str, en_nombre_del_jefe: bool = False):
+    """Dibuja una solicitud como tarjeta con botones de aprobar y rechazar.
+
+    etapa: 'jefe'  → firma del jefe inmediato (pasa la solicitud a RRHH)
+           'rrhh'  → firma final de RRHH (deja la solicitud aprobada)
+    en_nombre_del_jefe: RRHH registra la autorización que el jefe dio por fuera.
+    """
+    d = _datos_solicitud(sm, fila, tipo)
+    email_emp, email_jefe, email_rrhh = _correos_de(sm, d["emp_id"], config)
+    k = f"{tipo}_{etapa}_{d['id']}"
+
+    with st.container(border=True):
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            st.markdown(f"### {d['nombre']}")
+            st.caption(f"ID empleado: {d['emp_id']}  ·  Solicitud: {d['id']}")
+        with c2:
+            st.markdown(f"**{d['titulo']}**")
+
+        for etiqueta, valor in d["detalle"]:
+            st.markdown(f"**{etiqueta}:** {valor}")
+
+        # Si el jefe ya firmó, mostrarlo para que RRHH tenga el contexto
+        firma_jefe = str(fila.get("Aprobado_Jefe", "") or "").strip()
+        if firma_jefe:
+            st.success(f"👤 Jefe inmediato: **{firma_jefe}** "
+                       f"({fila.get('Fecha_Aprob_Jefe', '')})")
+        elif etapa == "rrhh":
+            st.caption("Sin registro de aprobación del jefe inmediato.")
+
+        if en_nombre_del_jefe:
+            st.warning("Esta solicitud aún espera al jefe inmediato "
+                       f"({email_jefe or 'sin correo asignado'}). "
+                       "Puedes registrar aquí su autorización si ya la dio por otro medio.")
+
+        aprobador = st.text_input(
+            "Aprobado por (nombre y cargo) *", value=aprobador_default,
+            key=f"apr_{k}",
+            help="Queda registrado en la hoja y en el correo que recibe el empleado.")
+
+        b1, b2 = st.columns(2)
+        with b1:
+            etiqueta_btn = ("✅ Registrar aprobación del jefe" if en_nombre_del_jefe
+                            else "✅ Aprobar")
+            if st.button(etiqueta_btn, key=f"ok_{k}", type="primary",
+                         use_container_width=True):
+                if not aprobador.strip():
+                    st.error("Indica quién aprueba.")
+                else:
+                    _procesar_aprobacion(sm, config, d, tipo, etapa, aprobador.strip(),
+                                         email_emp, email_jefe, email_rrhh,
+                                         en_nombre_del_jefe)
+        with b2:
+            with st.popover("❌ Rechazar", use_container_width=True):
+                motivo_rech = st.text_area("Motivo del rechazo *", key=f"mr_{k}",
+                                           placeholder="Explica brevemente por qué se rechaza.")
+                if st.button("Confirmar rechazo", key=f"no_{k}", use_container_width=True):
+                    if not motivo_rech.strip():
+                        st.error("El motivo del rechazo es obligatorio.")
+                    elif not aprobador.strip():
+                        st.error("Indica quién rechaza.")
+                    else:
+                        _procesar_rechazo(sm, config, d, tipo, aprobador.strip(),
+                                          motivo_rech.strip(), email_emp, email_jefe,
+                                          email_rrhh)
+
+
+def _procesar_aprobacion(sm, config, d, tipo, etapa, aprobador,
+                         email_emp, email_jefe, email_rrhh, en_nombre_del_jefe):
+    """Guarda la aprobación y envía los correos correspondientes."""
+    es_permiso = (tipo == "permiso")
+    try:
+        with st.spinner("Guardando aprobación…"):
+            if etapa == "jefe" or en_nombre_del_jefe:
+                if es_permiso:
+                    sm.aprobar_permiso_jefe(d["id"], aprobador)
+                else:
+                    sm.aprobar_vacaciones_jefe(d["id"], aprobador)
+            else:
+                if es_permiso:
+                    sm.aprobar_permiso_rrhh(d["id"], aprobador)
+                else:
+                    sm.aprobar_vacaciones_rrhh(d["id"], aprobador)
+    except Exception as e:
+        st.error(f"❌ No se pudo guardar la aprobación: {e}")
+        return
+
+    final = (etapa == "rrhh" and not en_nombre_del_jefe)
+    filas = d["detalle"] + [("Aprobado por", aprobador)]
+
+    if final:
+        st.success(f"✅ {d['asunto'].capitalize()} **{d['id']}** aprobado en firme.")
+        cuerpo = (f"<p>La solicitud de <strong>{esc(d['asunto'])}</strong> de "
+                  f"<strong>{esc(d['nombre'])}</strong> quedó "
+                  f"<strong style='color:#065F46'>APROBADA</strong> por RRHH.</p>"
+                  + tabla_html(filas))
+        destinos = [email_emp, email_jefe, email_rrhh]
+        asunto = f"{d['asunto'].capitalize()} aprobado – {d['nombre']}"
+    else:
+        st.success(f"✅ Aprobación del jefe registrada. "
+                   f"La solicitud **{d['id']}** pasa a revisión de RRHH.")
+        cuerpo = (f"<p>El jefe inmediato aprobó la solicitud de "
+                  f"<strong>{esc(d['asunto'])}</strong> de "
+                  f"<strong>{esc(d['nombre'])}</strong>. "
+                  f"Queda pendiente la revisión final de RRHH.</p>"
+                  + tabla_html(filas))
+        destinos = [email_rrhh, email_emp]
+        asunto = f"Pendiente de RRHH: {d['asunto']} – {d['nombre']}"
+
+    enviados, fallidos = notificar(destinos, asunto, cuerpo)
+    mostrar_envio(enviados, fallidos)
+    st.rerun()
+
+
+def _procesar_rechazo(sm, config, d, tipo, quien, motivo,
+                      email_emp, email_jefe, email_rrhh):
+    try:
+        with st.spinner("Registrando rechazo…"):
+            if tipo == "permiso":
+                sm.rechazar_permiso(d["id"], quien, motivo)
+            else:
+                sm.rechazar_vacaciones(d["id"], quien, motivo)
+    except Exception as e:
+        st.error(f"❌ No se pudo registrar el rechazo: {e}")
+        return
+
+    st.warning(f"Solicitud **{d['id']}** rechazada.")
+    cuerpo = (f"<p>La solicitud de <strong>{esc(d['asunto'])}</strong> de "
+              f"<strong>{esc(d['nombre'])}</strong> fue "
+              f"<strong style='color:#991B1B'>RECHAZADA</strong>.</p>"
+              + tabla_html(d["detalle"] + [("Rechazada por", quien),
+                                           ("Motivo del rechazo", motivo)]))
+    enviados, fallidos = notificar([email_emp, email_jefe, email_rrhh],
+                                   f"{d['asunto'].capitalize()} rechazado – {d['nombre']}",
+                                   cuerpo)
+    mostrar_envio(enviados, fallidos)
+    st.rerun()
+
+
+def _tabla_estado(df, tipo: str):
+    """Tabla legible para el empleado, con la etapa exacta del trámite."""
+    if df.empty:
+        return df
+    out = df.copy()
+    out["Situación"] = out["Estado"].apply(etiqueta_estado)
+    cols = (["ID_Permiso", "Fecha", "Horas_Solicitadas", "Motivo", "Situación"]
+            if tipo == "permiso" else
+            ["ID_Vacacion", "Fecha_Inicio", "Fecha_Fin", "Dias_Habiles", "Situación"])
+    extra = [c for c in ("Aprobado_Jefe", "Aprobado_RRHH", "Motivo_Rechazo")
+             if c in out.columns and out[c].astype(str).str.strip().ne("").any()]
+    return out[[c for c in cols + extra if c in out.columns]]
+
+
+# ── Módulo: Aprobaciones del jefe inmediato ──────────────────────────────────
+def page_aprobaciones_jefe():
+    sm = get_sm()
+    config = st.session_state.config
+    usuario = get_usuario()
+    correo = email_usuario_actual()
+
+    st.title("✍️ Aprobaciones de mi equipo")
+
+    equipo = sm.get_subordinados(correo)
+    if equipo.empty:
+        st.info("No hay empleados asignados a tu cargo.")
+        return
+    st.caption(f"Tienes **{len(equipo)}** persona(s) a cargo.")
+
+    perm_pend = sm.permisos_pendientes_jefe(correo)
+    vac_pend  = sm.vacaciones_pendientes_jefe(correo)
+    total = len(perm_pend) + len(vac_pend)
+
+    if total == 0:
+        st.success("✅ No tienes solicitudes pendientes por aprobar.")
+    else:
+        st.warning(f"⏳ Tienes **{total}** solicitud(es) esperando tu aprobación.")
+
+    firma = f"{usuario.get('nombre', '')}".strip()
+
+    t1, t2, t3 = st.tabs([f"📋 Permisos ({len(perm_pend)})",
+                          f"🏖️ Vacaciones ({len(vac_pend)})",
+                          "👥 Mi equipo"])
+    with t1:
+        if perm_pend.empty:
+            st.info("Sin permisos pendientes.")
+        for _, fila in perm_pend.iterrows():
+            tarjeta_aprobacion(sm, config, fila, "permiso", "jefe", firma)
+
+    with t2:
+        if vac_pend.empty:
+            st.info("Sin solicitudes de vacaciones pendientes.")
+        for _, fila in vac_pend.iterrows():
+            tarjeta_aprobacion(sm, config, fila, "vacacion", "jefe", firma)
+
+    with t3:
+        st.dataframe(equipo[[c for c in ("ID_Empleado", "Nombre", "Email", "Area")
+                             if c in equipo.columns]],
+                     use_container_width=True, hide_index=True)
 
 
 # ── Módulo: Permisos (con restricción por rol) ────────────────────────────────
@@ -1088,62 +1330,54 @@ def _page_permisos_con_rol():
     limite = _cfg_float(config, "Horas_Permiso_Mensual", 3.0)
     email_rrhh = config.get("Email_RRHH", "")
 
-    # ── Vista ADMIN ──────────────────────────────────────────────────────────
+    # ── Vista RRHH / ADMIN ───────────────────────────────────────────────────
     if admin:
-        tab_pend, tab_all, tab_new = st.tabs(["⏳ Pendientes de aprobación", "📋 Todas las solicitudes", "➕ Nueva solicitud"])
-
+        pend_rrhh = sm.permisos_pendientes_rrhh()
         df_p = sm.get_permisos()
-        pend = df_p[df_p["Estado"].astype(str) == "Pendiente_Aprobacion"] if not df_p.empty else pd.DataFrame()
+        pend_jefe = df_p[df_p["Estado"].astype(str) == EST_PEND_JEFE] if not df_p.empty else pd.DataFrame()
 
-        with tab_pend:
-            if pend.empty:
-                st.success("✅ No hay permisos pendientes de aprobación.")
+        tabs = st.tabs([f"⏳ Para aprobar ({len(pend_rrhh)})",
+                        f"👤 Esperando al jefe ({len(pend_jefe)})",
+                        "📋 Historial",
+                        "➕ Nueva solicitud"])
+
+        with tabs[0]:
+            if pend_rrhh.empty:
+                st.success("✅ No hay permisos esperando la firma de RRHH.")
             else:
-                st.info(f"**{len(pend)}** permiso(s) esperando aprobación")
-                st.dataframe(pend, use_container_width=True, hide_index=True)
-                st.divider()
-                perm_sel = st.selectbox("Seleccionar permiso a aprobar",
-                    pend.apply(lambda r: f"{r['ID_Permiso']} – Emp.{r['ID_Empleado']} – {r['Fecha']} ({r['Horas_Solicitadas']}h)", axis=1).tolist())
-                perm_id = perm_sel.split(" – ")[0]
-                aprobador = st.text_input("Aprobado por (nombre o cargo) *",
-                                          placeholder="Ej: Karina Bastidas – Jefe RRHH")
-                if st.button("✅ Aprobar este permiso", type="primary", use_container_width=True):
-                    if aprobador.strip():
-                        with st.spinner("Aprobando…"):
-                            sm.aprobar_permiso(perm_id, aprobador)
-                        st.success(f"✅ Permiso **{perm_id}** aprobado")
-                        # Notificar al empleado
-                        perm_row = pend[pend["ID_Permiso"].astype(str) == perm_id].iloc[0]
-                        email_emp = sm.get_email_empleado(str(perm_row["ID_Empleado"]))
-                        if email_emp:
-                            cuerpo = f"""<p>Su solicitud de permiso ha sido <strong style="color:#065F46">aprobada</strong>.</p>
-                            <table style="border-collapse:collapse;width:100%">
-                              <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>ID Permiso:</strong></td>
-                                  <td style="padding:6px 12px;border-bottom:1px solid #eee">{perm_id}</td></tr>
-                              <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>Fecha:</strong></td>
-                                  <td style="padding:6px 12px;border-bottom:1px solid #eee">{perm_row['Fecha']}</td></tr>
-                              <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>Horas:</strong></td>
-                                  <td style="padding:6px 12px;border-bottom:1px solid #eee">{perm_row['Horas_Solicitadas']}h</td></tr>
-                              <tr><td style="padding:6px 12px"><strong>Aprobado por:</strong></td>
-                                  <td style="padding:6px 12px">{aprobador}</td></tr>
-                            </table>"""
-                            ok = enviar_notificacion_email(email_emp, "Permiso aprobado", cuerpo)
-                            if ok:
-                                st.info(f"📧 Notificación enviada a {email_emp}")
-                        st.rerun()
-                    else:
-                        st.error("Ingresa quién aprueba.")
+                st.info(f"**{len(pend_rrhh)}** permiso(s) con el visto bueno del jefe, "
+                        "listos para tu aprobación final.")
+                firma = usuario.get("nombre", "RRHH")
+                for _, fila in pend_rrhh.iterrows():
+                    tarjeta_aprobacion(sm, config, fila, "permiso", "rrhh", firma)
 
-        with tab_all:
+        with tabs[1]:
+            if pend_jefe.empty:
+                st.success("✅ Ninguna solicitud está detenida en el jefe inmediato.")
+            else:
+                st.caption("Estas solicitudes esperan al jefe inmediato. Si el jefe ya "
+                           "autorizó por correo o de forma verbal, puedes registrarlo aquí.")
+                firma = usuario.get("nombre", "RRHH")
+                for _, fila in pend_jefe.iterrows():
+                    tarjeta_aprobacion(sm, config, fila, "permiso", "jefe", firma,
+                                       en_nombre_del_jefe=True)
+
+        with tabs[2]:
             if df_p.empty:
                 st.info("No hay solicitudes de permisos.")
             else:
-                filtro_est = st.selectbox("Filtrar por estado", ["Todos", "Pendiente_Aprobacion", "Aprobado"])
+                opciones_est = ["Todos", EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO]
+                filtro_est = st.selectbox("Filtrar por estado", opciones_est,
+                                          format_func=lambda v: "Todos" if v == "Todos"
+                                          else etiqueta_estado_corta(v))
                 df_pf = df_p if filtro_est == "Todos" else df_p[df_p["Estado"].astype(str) == filtro_est]
-                st.dataframe(df_pf, use_container_width=True, hide_index=True)
+                vista = df_pf.copy()
+                if not vista.empty:
+                    vista["Estado"] = vista["Estado"].apply(etiqueta_estado_corta)
+                st.dataframe(vista, use_container_width=True, hide_index=True)
                 st.caption(f"{len(df_pf)} solicitud(es)")
 
-        with tab_new:
+        with tabs[3]:
             st.info(f"ℹ️ Límite mensual: **{limite} horas por empleado**")
             opciones_a = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
                           for _, r in df_emp.iterrows()} if not df_emp.empty else {}
@@ -1152,75 +1386,97 @@ def _page_permisos_con_rol():
             else:
                 with st.form("form_permiso_admin", clear_on_submit=True):
                     sel = st.selectbox("Empleado", list(opciones_a.keys()))
-                    emp_id = opciones_a[sel]
                     fecha_p  = st.date_input("Fecha del permiso", date.today())
-                    horas_p  = st.number_input("Horas solicitadas", min_value=0.5, max_value=8.0, step=0.5, value=1.0)
+                    horas_p  = st.number_input("Horas solicitadas", min_value=0.5,
+                                               max_value=8.0, step=0.5, value=1.0)
                     motivo_p = st.text_area("Motivo *")
                     if st.form_submit_button("📤 Registrar permiso", type="primary"):
                         if not motivo_p.strip():
                             st.error("El motivo es obligatorio.")
                         else:
-                            with st.spinner("Registrando…"):
-                                estado = sm.solicitar_permiso(emp_id, fecha_p.strftime("%Y-%m-%d"), horas_p, motivo_p, config)
-                            st.success(f"✅ Permiso registrado – Estado: **{estado}**")
+                            _crear_permiso(sm, config, opciones_a[sel],
+                                           sel.split(" – ")[-1],
+                                           fecha_p, horas_p, motivo_p.strip(), email_rrhh)
 
     # ── Vista EMPLEADO ───────────────────────────────────────────────────────
     else:
         tab1, tab2 = st.tabs(["➕ Solicitar permiso", "📋 Mis permisos"])
 
-        opciones = {}
-        if not df_emp.empty and usuario:
-            mask = df_emp["ID_Empleado"].astype(str) == usuario["id_empleado"]
-            for _, r in df_emp[mask].iterrows():
-                opciones[f"{r['ID_Empleado']} – {r['Nombre']}"] = str(r["ID_Empleado"])
+        emp_id = usuario["id_empleado"] if usuario else ""
+        emp = sm.get_empleado(emp_id)
 
         with tab1:
-            st.info(f"ℹ️ Límite mensual: **{limite} horas por empleado**")
-            if not opciones:
-                st.warning("No se encontró tu perfil de empleado.")
+            if not emp:
+                st.warning("No se encontró tu perfil de empleado. Avisa a RRHH.")
             else:
+                nombre_emp = str(emp.get("Nombre", emp_id))
+                jefe = sm.get_email_jefe(emp_id)
+                st.info(f"👤 Solicitud para: **{emp_id} – {nombre_emp}**")
+                if jefe:
+                    st.caption(f"Tu solicitud irá primero a tu jefe inmediato ({jefe}) "
+                               "y después a RRHH.")
+                else:
+                    st.caption("No tienes jefe inmediato asignado: tu solicitud irá "
+                               "directamente a RRHH.")
+
                 with st.form("form_permiso", clear_on_submit=True):
-                    emp_id = list(opciones.values())[0]
-                    nombre_emp = list(opciones.keys())[0]
-                    st.info(f"👤 Solicitud para: **{nombre_emp}**")
                     fecha_p  = st.date_input("Fecha del permiso", date.today())
-                    horas_p  = st.number_input("Horas solicitadas", min_value=0.5, max_value=8.0, step=0.5, value=1.0)
+                    horas_p  = st.number_input("Horas solicitadas", min_value=0.5,
+                                               max_value=8.0, step=0.5, value=1.0)
                     motivo_p = st.text_area("Motivo *")
                     año_mes  = fecha_p.strftime("%Y-%m")
                     usadas   = sm.horas_permiso_usadas_mes(emp_id, año_mes)
-                    disponibles = max(0, limite - usadas)
-                    st.caption(f"Horas usadas este mes: **{usadas:.1f}h** | Disponibles: **{disponibles:.1f}h**")
+                    st.caption(f"Horas usadas este mes: **{usadas:.1f}h** de **{limite:.1f}h** "
+                               f"· Disponibles: **{max(0, limite - usadas):.1f}h**")
                     if st.form_submit_button("📤 Enviar solicitud", type="primary"):
                         if not motivo_p.strip():
                             st.error("El motivo es obligatorio.")
                         else:
-                            with st.spinner("Enviando…"):
-                                estado = sm.solicitar_permiso(emp_id, fecha_p.strftime("%Y-%m-%d"), horas_p, motivo_p, config)
-                            st.success(f"✅ Permiso solicitado – Estado: **{estado}**")
-                            # Notificar a RRHH
-                            if email_rrhh:
-                                cuerpo_rrhh = f"""<p>El empleado <strong>{nombre_emp.split(' – ')[-1]}</strong> ha solicitado un permiso.</p>
-                                <table style="border-collapse:collapse;width:100%">
-                                  <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>Empleado:</strong></td>
-                                      <td style="padding:6px 12px;border-bottom:1px solid #eee">{nombre_emp}</td></tr>
-                                  <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>Fecha:</strong></td>
-                                      <td style="padding:6px 12px;border-bottom:1px solid #eee">{fecha_p.strftime('%d/%m/%Y')}</td></tr>
-                                  <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>Horas:</strong></td>
-                                      <td style="padding:6px 12px;border-bottom:1px solid #eee">{horas_p}h</td></tr>
-                                  <tr><td style="padding:6px 12px"><strong>Motivo:</strong></td>
-                                      <td style="padding:6px 12px">{motivo_p}</td></tr>
-                                </table>
-                                <p style="margin-top:16px">Ingresa al sistema para aprobar o rechazar la solicitud.</p>"""
-                                enviar_notificacion_email(email_rrhh, f"Nueva solicitud de permiso – {nombre_emp.split(' – ')[-1]}", cuerpo_rrhh)
+                            _crear_permiso(sm, config, emp_id, nombre_emp,
+                                           fecha_p, horas_p, motivo_p.strip(), email_rrhh)
 
         with tab2:
             df_p = sm.get_permisos()
             if not df_p.empty and usuario:
-                df_p = df_p[df_p["ID_Empleado"].astype(str) == usuario["id_empleado"]]
+                df_p = df_p[df_p["ID_Empleado"].astype(str).str.strip() == str(emp_id).strip()]
             if df_p.empty:
                 st.info("No tienes solicitudes de permisos.")
             else:
-                st.dataframe(df_p, use_container_width=True, hide_index=True)
+                st.dataframe(_tabla_estado(df_p, "permiso"),
+                             use_container_width=True, hide_index=True)
+
+
+def _crear_permiso(sm, config, emp_id, nombre_emp, fecha_p, horas_p, motivo_p, email_rrhh):
+    """Registra el permiso y notifica al jefe inmediato y a RRHH."""
+    try:
+        with st.spinner("Enviando…"):
+            res = sm.solicitar_permiso(emp_id, fecha_p.strftime("%Y-%m-%d"),
+                                       horas_p, motivo_p, config)
+    except Exception as e:
+        st.error(f"❌ No se pudo registrar la solicitud: {e}")
+        return
+
+    st.success(f"✅ Permiso **{res['id']}** enviado — {etiqueta_estado(res['estado'])}")
+    if res["excede_cupo"]:
+        st.warning(f"⚠️ Con esta solicitud acumulas **{res['horas_usadas']:.1f}h** "
+                   f"y el límite mensual es **{res['limite']:.1f}h**. "
+                   "Requiere autorización expresa.")
+
+    filas = [("Empleado", f"{emp_id} – {nombre_emp}"),
+             ("Fecha", fecha_p.strftime("%d/%m/%Y")),
+             ("Horas solicitadas", f"{horas_p} h"),
+             ("Motivo", motivo_p),
+             ("Horas acumuladas en el mes", f"{res['horas_usadas']:.1f} h de {res['limite']:.1f} h")]
+    cuerpo = (f"<p><strong>{esc(nombre_emp)}</strong> ha solicitado un permiso.</p>"
+              + tabla_html(filas)
+              + "<p style='margin-top:16px'>Ingresa al sistema para aprobar o rechazar "
+                "la solicitud.</p>")
+    enviados, fallidos = notificar([res["email_jefe"], email_rrhh],
+                                   f"Nueva solicitud de permiso – {nombre_emp}", cuerpo)
+    mostrar_envio(enviados, fallidos)
+    if not res["email_jefe"]:
+        st.caption("ℹ️ Este empleado no tiene jefe inmediato registrado en su ficha, "
+                   "así que solo se notificó a RRHH.")
 
 
 # ── Módulo: Vacaciones (con restricción por rol) ──────────────────────────────
@@ -1234,64 +1490,53 @@ def _page_vacaciones_con_rol():
     df_emp = sm.get_empleados()
     email_rrhh = config.get("Email_RRHH", "")
 
-    # ── Vista ADMIN ──────────────────────────────────────────────────────────
+    # ── Vista RRHH / ADMIN ───────────────────────────────────────────────────
     if admin:
-        tab_pend, tab_all, tab_new = st.tabs(["⏳ Pendientes de aprobación", "📋 Todas las solicitudes", "➕ Nueva solicitud"])
-
+        pend_rrhh = sm.vacaciones_pendientes_rrhh()
         df_v = sm.get_vacaciones()
-        pend_v = df_v[df_v["Estado"].astype(str) == "Pendiente"] if not df_v.empty else pd.DataFrame()
+        pend_jefe = df_v[df_v["Estado"].astype(str) == EST_PEND_JEFE] if not df_v.empty else pd.DataFrame()
 
-        with tab_pend:
-            if pend_v.empty:
-                st.success("✅ No hay vacaciones pendientes de aprobación.")
+        tabs = st.tabs([f"⏳ Para aprobar ({len(pend_rrhh)})",
+                        f"👤 Esperando al jefe ({len(pend_jefe)})",
+                        "📋 Historial",
+                        "➕ Nueva solicitud"])
+
+        with tabs[0]:
+            if pend_rrhh.empty:
+                st.success("✅ No hay vacaciones esperando la firma de RRHH.")
             else:
-                st.info(f"**{len(pend_v)}** solicitud(es) esperando aprobación")
-                st.dataframe(pend_v, use_container_width=True, hide_index=True)
-                st.divider()
-                vac_sel = st.selectbox("Seleccionar solicitud a aprobar",
-                    pend_v.apply(lambda r: f"{r['ID_Vacacion']} – Emp.{r['ID_Empleado']} ({r['Fecha_Inicio']} → {r['Fecha_Fin']}, {r['Dias_Habiles']} días háb.)", axis=1).tolist())
-                vac_id_ap  = vac_sel.split(" – ")[0]
-                aprobador_v = st.text_input("Aprobado por (nombre o cargo) *",
-                                             placeholder="Ej: Karina Bastidas – Jefe RRHH")
-                if st.button("✅ Aprobar vacaciones", type="primary", use_container_width=True):
-                    if aprobador_v.strip():
-                        with st.spinner("Aprobando…"):
-                            sm.aprobar_vacaciones(vac_id_ap, aprobador_v)
-                        st.success(f"✅ Vacaciones **{vac_id_ap}** aprobadas")
-                        # Notificar al empleado
-                        vac_row = pend_v[pend_v["ID_Vacacion"].astype(str) == vac_id_ap].iloc[0]
-                        email_emp = sm.get_email_empleado(str(vac_row["ID_Empleado"]))
-                        if email_emp:
-                            cuerpo = f"""<p>Su solicitud de vacaciones ha sido <strong style="color:#065F46">aprobada</strong>.</p>
-                            <table style="border-collapse:collapse;width:100%">
-                              <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>ID Vacación:</strong></td>
-                                  <td style="padding:6px 12px;border-bottom:1px solid #eee">{vac_id_ap}</td></tr>
-                              <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>Desde:</strong></td>
-                                  <td style="padding:6px 12px;border-bottom:1px solid #eee">{vac_row['Fecha_Inicio']}</td></tr>
-                              <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>Hasta:</strong></td>
-                                  <td style="padding:6px 12px;border-bottom:1px solid #eee">{vac_row['Fecha_Fin']}</td></tr>
-                              <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>Días hábiles:</strong></td>
-                                  <td style="padding:6px 12px;border-bottom:1px solid #eee">{vac_row['Dias_Habiles']}</td></tr>
-                              <tr><td style="padding:6px 12px"><strong>Aprobado por:</strong></td>
-                                  <td style="padding:6px 12px">{aprobador_v}</td></tr>
-                            </table>"""
-                            ok = enviar_notificacion_email(email_emp, "Vacaciones aprobadas", cuerpo)
-                            if ok:
-                                st.info(f"📧 Notificación enviada a {email_emp}")
-                        st.rerun()
-                    else:
-                        st.error("Ingresa quién aprueba.")
+                st.info(f"**{len(pend_rrhh)}** solicitud(es) con el visto bueno del jefe.")
+                firma = usuario.get("nombre", "RRHH")
+                for _, fila in pend_rrhh.iterrows():
+                    tarjeta_aprobacion(sm, config, fila, "vacacion", "rrhh", firma)
 
-        with tab_all:
+        with tabs[1]:
+            if pend_jefe.empty:
+                st.success("✅ Ninguna solicitud está detenida en el jefe inmediato.")
+            else:
+                st.caption("Estas solicitudes esperan al jefe inmediato. Si el jefe ya "
+                           "autorizó por otro medio, puedes registrarlo aquí.")
+                firma = usuario.get("nombre", "RRHH")
+                for _, fila in pend_jefe.iterrows():
+                    tarjeta_aprobacion(sm, config, fila, "vacacion", "jefe", firma,
+                                       en_nombre_del_jefe=True)
+
+        with tabs[2]:
             if df_v.empty:
                 st.info("No hay solicitudes de vacaciones.")
             else:
-                filtro_v = st.selectbox("Filtrar", ["Todos", "Pendiente", "Aprobado"])
+                opciones_est = ["Todos", EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO]
+                filtro_v = st.selectbox("Filtrar por estado", opciones_est,
+                                        format_func=lambda v: "Todos" if v == "Todos"
+                                        else etiqueta_estado_corta(v))
                 df_vf = df_v if filtro_v == "Todos" else df_v[df_v["Estado"].astype(str) == filtro_v]
-                st.dataframe(df_vf, use_container_width=True, hide_index=True)
+                vista = df_vf.copy()
+                if not vista.empty:
+                    vista["Estado"] = vista["Estado"].apply(etiqueta_estado_corta)
+                st.dataframe(vista, use_container_width=True, hide_index=True)
                 st.caption(f"{len(df_vf)} solicitud(es)")
 
-        with tab_new:
+        with tabs[3]:
             opciones_a = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
                           for _, r in df_emp.iterrows()} if not df_emp.empty else {}
             if not opciones_a:
@@ -1299,76 +1544,86 @@ def _page_vacaciones_con_rol():
             else:
                 with st.form("form_vac_admin", clear_on_submit=True):
                     sel = st.selectbox("Empleado", list(opciones_a.keys()))
-                    emp_id = opciones_a[sel]
                     c1, c2 = st.columns(2)
                     with c1: fecha_ini = st.date_input("Fecha de inicio")
                     with c2: fecha_fin = st.date_input("Fecha de fin")
-                    if fecha_fin >= fecha_ini:
-                        dias = sm.dias_habiles(fecha_ini.strftime("%Y-%m-%d"), fecha_fin.strftime("%Y-%m-%d"))
-                        st.caption(f"📆 Días hábiles: **{dias}**")
                     if st.form_submit_button("📤 Registrar solicitud", type="primary"):
                         if fecha_fin < fecha_ini:
-                            st.error("La fecha de fin debe ser posterior.")
+                            st.error("La fecha de fin debe ser posterior a la de inicio.")
                         else:
-                            with st.spinner("Registrando…"):
-                                vac_id = sm.solicitar_vacaciones(emp_id, fecha_ini.strftime("%Y-%m-%d"), fecha_fin.strftime("%Y-%m-%d"))
-                            st.success(f"✅ Vacaciones registradas: **{vac_id}** – Estado: Pendiente")
+                            _crear_vacaciones(sm, config, opciones_a[sel],
+                                              sel.split(" – ")[-1],
+                                              fecha_ini, fecha_fin, email_rrhh)
 
     # ── Vista EMPLEADO ───────────────────────────────────────────────────────
     else:
         tab1, tab2 = st.tabs(["➕ Solicitar vacaciones", "📋 Mis vacaciones"])
 
-        opciones = {}
-        if not df_emp.empty and usuario:
-            mask = df_emp["ID_Empleado"].astype(str) == usuario["id_empleado"]
-            for _, r in df_emp[mask].iterrows():
-                opciones[f"{r['ID_Empleado']} – {r['Nombre']}"] = str(r["ID_Empleado"])
+        emp_id = usuario["id_empleado"] if usuario else ""
+        emp = sm.get_empleado(emp_id)
 
         with tab1:
-            if not opciones:
-                st.warning("No se encontró tu perfil de empleado.")
+            if not emp:
+                st.warning("No se encontró tu perfil de empleado. Avisa a RRHH.")
             else:
+                nombre_emp = str(emp.get("Nombre", emp_id))
+                jefe = sm.get_email_jefe(emp_id)
+                st.info(f"👤 Solicitud para: **{emp_id} – {nombre_emp}**")
+                if jefe:
+                    st.caption(f"Tu solicitud irá primero a tu jefe inmediato ({jefe}) "
+                               "y después a RRHH.")
+                else:
+                    st.caption("No tienes jefe inmediato asignado: tu solicitud irá "
+                               "directamente a RRHH.")
+
                 with st.form("form_vac", clear_on_submit=True):
-                    emp_id = list(opciones.values())[0]
-                    nombre_emp = list(opciones.keys())[0]
-                    st.info(f"👤 Solicitud para: **{nombre_emp}**")
                     c1, c2 = st.columns(2)
                     with c1: fecha_ini = st.date_input("Fecha de inicio")
                     with c2: fecha_fin = st.date_input("Fecha de fin")
-                    if fecha_fin >= fecha_ini:
-                        dias = sm.dias_habiles(fecha_ini.strftime("%Y-%m-%d"), fecha_fin.strftime("%Y-%m-%d"))
-                        st.caption(f"📆 Días hábiles: **{dias}**")
                     if st.form_submit_button("📤 Enviar solicitud", type="primary"):
                         if fecha_fin < fecha_ini:
-                            st.error("La fecha de fin debe ser posterior.")
+                            st.error("La fecha de fin debe ser posterior a la de inicio.")
                         else:
-                            with st.spinner("Enviando…"):
-                                vac_id = sm.solicitar_vacaciones(emp_id, fecha_ini.strftime("%Y-%m-%d"), fecha_fin.strftime("%Y-%m-%d"))
-                            st.success(f"✅ Vacaciones solicitadas: **{vac_id}** – Estado: Pendiente")
-                            # Notificar a RRHH
-                            if email_rrhh:
-                                cuerpo_rrhh = f"""<p>El empleado <strong>{nombre_emp.split(' – ')[-1]}</strong> ha solicitado vacaciones.</p>
-                                <table style="border-collapse:collapse;width:100%">
-                                  <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>Empleado:</strong></td>
-                                      <td style="padding:6px 12px;border-bottom:1px solid #eee">{nombre_emp}</td></tr>
-                                  <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>Desde:</strong></td>
-                                      <td style="padding:6px 12px;border-bottom:1px solid #eee">{fecha_ini.strftime('%d/%m/%Y')}</td></tr>
-                                  <tr><td style="padding:6px 12px;border-bottom:1px solid #eee"><strong>Hasta:</strong></td>
-                                      <td style="padding:6px 12px;border-bottom:1px solid #eee">{fecha_fin.strftime('%d/%m/%Y')}</td></tr>
-                                  <tr><td style="padding:6px 12px"><strong>Días hábiles:</strong></td>
-                                      <td style="padding:6px 12px">{dias}</td></tr>
-                                </table>
-                                <p style="margin-top:16px">Ingresa al sistema para aprobar o rechazar la solicitud (<strong>{vac_id}</strong>).</p>"""
-                                enviar_notificacion_email(email_rrhh, f"Nueva solicitud de vacaciones – {nombre_emp.split(' – ')[-1]}", cuerpo_rrhh)
+                            _crear_vacaciones(sm, config, emp_id, nombre_emp,
+                                              fecha_ini, fecha_fin, email_rrhh)
 
         with tab2:
             df_v = sm.get_vacaciones()
             if not df_v.empty and usuario:
-                df_v = df_v[df_v["ID_Empleado"].astype(str) == usuario["id_empleado"]]
+                df_v = df_v[df_v["ID_Empleado"].astype(str).str.strip() == str(emp_id).strip()]
             if df_v.empty:
                 st.info("No tienes solicitudes de vacaciones.")
             else:
-                st.dataframe(df_v, use_container_width=True, hide_index=True)
+                st.dataframe(_tabla_estado(df_v, "vacacion"),
+                             use_container_width=True, hide_index=True)
+
+
+def _crear_vacaciones(sm, config, emp_id, nombre_emp, fecha_ini, fecha_fin, email_rrhh):
+    """Registra las vacaciones y notifica al jefe inmediato y a RRHH."""
+    try:
+        with st.spinner("Enviando…"):
+            res = sm.solicitar_vacaciones(emp_id, fecha_ini.strftime("%Y-%m-%d"),
+                                          fecha_fin.strftime("%Y-%m-%d"))
+    except Exception as e:
+        st.error(f"❌ No se pudo registrar la solicitud: {e}")
+        return
+
+    st.success(f"✅ Vacaciones **{res['id']}** enviadas — {etiqueta_estado(res['estado'])}")
+
+    filas = [("Empleado", f"{emp_id} – {nombre_emp}"),
+             ("Desde", fecha_ini.strftime("%d/%m/%Y")),
+             ("Hasta", fecha_fin.strftime("%d/%m/%Y")),
+             ("Días hábiles", res["dias"])]
+    cuerpo = (f"<p><strong>{esc(nombre_emp)}</strong> ha solicitado vacaciones.</p>"
+              + tabla_html(filas)
+              + "<p style='margin-top:16px'>Ingresa al sistema para aprobar o rechazar "
+                f"la solicitud (<strong>{esc(res['id'])}</strong>).</p>")
+    enviados, fallidos = notificar([res["email_jefe"], email_rrhh],
+                                   f"Nueva solicitud de vacaciones – {nombre_emp}", cuerpo)
+    mostrar_envio(enviados, fallidos)
+    if not res["email_jefe"]:
+        st.caption("ℹ️ Este empleado no tiene jefe inmediato registrado en su ficha, "
+                   "así que solo se notificó a RRHH.")
 
 
 # ── Módulo: Horas Extras (con restricción por rol) ────────────────────────────
@@ -1729,27 +1984,45 @@ def page_llamados_atencion():
                             )
                         st.success(f"✅ Llamado **{llamado_id}** ({tipo}) emitido para **{nombre_emp}**")
 
-                        # Notificación al empleado
-                        if email_emp:
-                            cuerpo = f"""<p>Estimado/a <strong>{nombre_emp}</strong>,</p>
-                            <p>Se ha emitido un <strong style="color:#991B1B">Llamado de Atención {tipo}</strong>.</p>
-                            <table style="border-collapse:collapse;width:100%;margin-top:12px">
-                              <tr style="background:#FEF3C7">
-                                <td style="padding:8px 12px;border-bottom:1px solid #eee"><strong>Tipo:</strong></td>
-                                <td style="padding:8px 12px;border-bottom:1px solid #eee">{tipo}</td></tr>
-                              <tr><td style="padding:8px 12px;border-bottom:1px solid #eee"><strong>Motivo:</strong></td>
-                                  <td style="padding:8px 12px;border-bottom:1px solid #eee">{motivo}</td></tr>
-                              <tr><td style="padding:8px 12px;border-bottom:1px solid #eee"><strong>Tardanzas acumuladas:</strong></td>
-                                  <td style="padding:8px 12px;border-bottom:1px solid #eee">{atrasos_mes}</td></tr>
-                              <tr><td style="padding:8px 12px"><strong>Emitido por:</strong></td>
-                                  <td style="padding:8px 12px">{registrado_por}</td></tr>
-                            </table>
-                            <p style="margin-top:16px">Para más información, comuníquese con el área de RRHH.</p>"""
-                            ok = enviar_notificacion_email(email_emp, f"Llamado de Atención – {tipo}", cuerpo)
-                            if ok:
-                                st.info(f"📧 Notificación enviada a {email_emp}")
-                            else:
-                                st.caption("ℹ️ Email no configurado – notifica manualmente al empleado.")
+                        # Notificación al empleado, a su jefe inmediato y a RRHH
+                        email_jefe = sm.get_email_jefe(emp_id)
+                        email_rrhh = st.session_state.config.get("Email_RRHH", "")
+                        detalle_la = [("Empleado", f"{emp_id} – {nombre_emp}"),
+                                      ("Tipo de llamado", tipo),
+                                      ("Motivo", motivo),
+                                      ("Tardanzas acumuladas en el mes", atrasos_mes),
+                                      ("Emitido por", registrado_por),
+                                      ("Fecha", date.today().strftime("%d/%m/%Y"))]
+
+                        cuerpo_emp = (
+                            f"<p>Estimado/a <strong>{esc(nombre_emp)}</strong>,</p>"
+                            f"<p>Se ha emitido un <strong style='color:#991B1B'>"
+                            f"Llamado de Atención {esc(tipo)}</strong> "
+                            f"(referencia <strong>{esc(llamado_id)}</strong>).</p>"
+                            + tabla_html(detalle_la)
+                            + "<p style='margin-top:16px'>Para más información, "
+                              "comuníquese con el área de RRHH.</p>")
+                        env_e, fall_e = notificar([email_emp],
+                                                  f"Llamado de Atención – {tipo}", cuerpo_emp)
+
+                        cuerpo_jefe = (
+                            f"<p>Se registró un <strong style='color:#991B1B'>"
+                            f"Llamado de Atención {esc(tipo)}</strong> para "
+                            f"<strong>{esc(nombre_emp)}</strong>, integrante de tu equipo.</p>"
+                            + tabla_html(detalle_la)
+                            + "<p style='margin-top:16px'>Esta notificación es informativa; "
+                              "el expediente queda registrado en el sistema.</p>")
+                        env_j, fall_j = notificar([email_jefe, email_rrhh],
+                                                  f"Llamado de Atención registrado – {nombre_emp}",
+                                                  cuerpo_jefe)
+
+                        mostrar_envio(env_e + env_j, fall_e + fall_j)
+                        if not email_emp:
+                            st.caption("ℹ️ El empleado no tiene correo en su ficha; "
+                                       "notifícale por otro medio.")
+                        if not email_jefe:
+                            st.caption("ℹ️ Este empleado no tiene jefe inmediato registrado "
+                                       "en su ficha, así que no se notificó a ningún jefe.")
 
     with tab3:
         st.subheader("Historial de Llamados de Atención")
@@ -1812,6 +2085,7 @@ def main():
     else:
         pages = {
             "Mi Asistencia":     page_asistencia,
+            "Aprobaciones":      page_aprobaciones_jefe,
             "Mis Permisos":      _page_permisos_con_rol,
             "Mis Vacaciones":    _page_vacaciones_con_rol,
             "Mis Horas Extra":   _page_horas_extras_con_rol,

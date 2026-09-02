@@ -36,6 +36,59 @@ def leer_secrets(seccion: str):
     return None
 
 
+def registrar_entrada_automatica():
+    """Marca la entrada del empleado al iniciar sesión, una sola vez al día.
+
+    Así nadie tiene que acordarse de pulsar un botón: con abrir el aplicativo
+    su asistencia queda registrada con la hora real de Ecuador. Si ya marcó
+    hoy no hace nada, así que volver a entrar más tarde no duplica el registro
+    ni cambia la hora original. No aplica a la cuenta de administrador.
+    """
+    if st.session_state.get("entrada_auto_hecha"):
+        return
+    st.session_state.entrada_auto_hecha = True   # se marca aunque falle, para no reintentar en bucle
+
+    usuario = get_usuario()
+    if not usuario or es_admin():
+        return
+    sm = get_sm()
+    if sm is None:
+        return
+
+    emp_id = str(usuario.get("id_empleado", "")).strip()
+    emp = sm.get_empleado(emp_id)
+    if not emp:
+        return   # sin ficha de empleado no hay a quién registrarle la asistencia
+
+    fecha_hoy = hoy().strftime("%Y-%m-%d")
+    try:
+        if sm.ya_registro_entrada(emp_id, fecha_hoy):
+            return
+        momento = ahora()
+        estado, atraso = sm.registrar_entrada(
+            emp_id, str(emp.get("Nombre", emp_id)),
+            momento.strftime("%H:%M"), st.session_state.config)
+        if estado == "Tardanza":
+            flash("warning", f"⏰ Tu entrada quedó registrada a las "
+                             f"{momento.strftime('%H:%M')} — {atraso} minuto(s) de atraso.")
+        else:
+            flash("success", f"✅ Tu entrada quedó registrada a las "
+                             f"{momento.strftime('%H:%M')}. ¡Buen día!")
+    except Exception as e:
+        flash("warning", f"No se pudo registrar tu entrada automáticamente ({e}). "
+                         "Márcala desde el módulo de Asistencia.")
+
+
+def secciones(etiquetas, key: str) -> str:
+    """Barra de secciones que conserva la elegida al recargar la página.
+
+    st.tabs siempre vuelve a la primera pestaña después de un st.rerun(), que
+    es lo que hacía saltar de Vacaciones a Permisos al aprobar una solicitud.
+    """
+    return st.radio("Sección", etiquetas, key=key, horizontal=True,
+                    label_visibility="collapsed")
+
+
 def flash(tipo: str, mensaje: str):
     """Guarda un mensaje para mostrarlo DESPUÉS del st.rerun().
 
@@ -605,6 +658,7 @@ def sidebar():
                 "⏰  Horas Extras",
                 "⚙️  Configuración",
                 "🔐  Gestión Usuarios",
+                "🏖️  Saldo Vacaciones",
                 "⚠️  Llamados de Atención",
                 "📁  Expediente",
             ]
@@ -779,6 +833,20 @@ def page_empleados():
                 hora_ini   = st.time_input("Horario de entrada", value=datetime.strptime("09:00", "%H:%M").time())
                 hora_fin   = st.time_input("Horario de salida",  value=datetime.strptime("17:30", "%H:%M").time())
 
+            st.divider()
+            st.caption("**Vacaciones** — necesarios para calcular su saldo")
+            v1, v2 = st.columns(2)
+            with v1:
+                f_ingreso = st.date_input("Fecha de ingreso a la empresa *",
+                                          value=hoy(), min_value=date(1970, 1, 1),
+                                          max_value=hoy(),
+                                          help="De aquí sale toda la antigüedad.")
+            with v2:
+                d_tomados = st.number_input("Días de vacaciones ya tomados",
+                                            min_value=0.0, max_value=999.0, step=0.5,
+                                            value=0.0,
+                                            help="Solo los tomados antes de usar el sistema.")
+
             submitted = st.form_submit_button("💾 Guardar empleado", type="primary")
             if submitted:
                 if not all([nombre, email, area, email_jefe]):
@@ -787,7 +855,8 @@ def page_empleados():
                     with st.spinner("Guardando…"):
                         emp_id = sm.agregar_empleado(
                             nombre, email, area, email_jefe,
-                            hora_ini.strftime("%H:%M"), hora_fin.strftime("%H:%M")
+                            hora_ini.strftime("%H:%M"), hora_fin.strftime("%H:%M"),
+                            f_ingreso.strftime("%Y-%m-%d"), d_tomados
                         )
                     st.success(f"✅ Empleado creado: **{emp_id} – {nombre}**")
 
@@ -814,13 +883,32 @@ def page_empleados():
                     hora_ini = st.time_input("Entrada", ini_t)
                     hora_fin = st.time_input("Salida",  fin_t)
 
+                st.divider()
+                st.caption("**Vacaciones**")
+                v1, v2 = st.columns(2)
+                with v1:
+                    ing_prev = sm._a_fecha(emp.get("Fecha_Ingreso"))
+                    f_ingreso = st.date_input("Fecha de ingreso a la empresa",
+                                              value=ing_prev or hoy(),
+                                              min_value=date(1970, 1, 1), max_value=hoy())
+                with v2:
+                    d_tomados = st.number_input(
+                        "Días de vacaciones ya tomados (carga inicial)",
+                        min_value=0.0, max_value=999.0, step=0.5,
+                        value=float(sm._a_numero(emp.get("Dias_Tomados_Inicial"), 0.0)))
+                if ing_prev is None:
+                    st.caption("⚠️ Sin fecha de ingreso no se puede calcular su saldo "
+                               "de vacaciones.")
+
                 if st.form_submit_button("💾 Actualizar", type="primary"):
                     with st.spinner("Actualizando…"):
                         sm.actualizar_empleado(
                             str(emp_id), nombre, email, area, email_jefe,
-                            hora_ini.strftime("%H:%M"), hora_fin.strftime("%H:%M")
+                            hora_ini.strftime("%H:%M"), hora_fin.strftime("%H:%M"),
+                            f_ingreso.strftime("%Y-%m-%d"), d_tomados
                         )
-                    st.success("✅ Empleado actualizado")
+                    flash("success", "✅ Empleado actualizado")
+                    st.rerun()
 
 
 # ── Módulo: Asistencia ────────────────────────────────────────────────────────
@@ -864,21 +952,30 @@ def page_asistencia():
             else:
                 emp_id, nombre = list(opciones.values())[0]
                 st.info(f"👤 Registrando asistencia para: **{nombre}**")
-            hora = st.time_input("Hora de entrada", value=ahora().time(), key="hora_entrada")
-
-            if st.button("📌 Registrar entrada", type="primary"):
-                if sm.ya_registro_entrada(emp_id, hoy_str):
-                    st.warning(f"⚠️ {nombre} ya tiene entrada registrada hoy_str.")
-                else:
+            if sm.ya_registro_entrada(emp_id, hoy_str):
+                st.success(f"✅ {nombre} ya tiene su entrada registrada hoy.")
+            else:
+                # La hora ya no se escribe a mano: se toma del reloj en el
+                # instante del clic, para que el registro no sea manipulable.
+                st.info(f"🕐 Hora actual en Ecuador: **{ahora().strftime('%H:%M')}**")
+                st.caption("La hora se toma automáticamente al registrar y no se "
+                           "puede modificar.")
+                if st.button("📌 Registrar mi entrada ahora", type="primary"):
+                    momento = ahora()
                     with st.spinner("Registrando…"):
-                        estado, atraso = sm.registrar_entrada(emp_id, nombre, hora.strftime("%H:%M"), config)
+                        estado, atraso = sm.registrar_entrada(
+                            emp_id, nombre, momento.strftime("%H:%M"), config)
                     if estado == "Tardanza":
-                        st.warning(f"⚠️ Tardanza registrada: **{atraso} minuto(s)** de retraso.")
+                        flash("warning", f"⏰ Entrada de **{nombre}** registrada a las "
+                                         f"{momento.strftime('%H:%M')} — "
+                                         f"**{atraso} minuto(s)** de atraso.")
                     else:
-                        st.success(f"✅ Entrada registrada a tiempo para **{nombre}**")
+                        flash("success", f"✅ Entrada de **{nombre}** registrada a tiempo, "
+                                         f"a las {momento.strftime('%H:%M')}.")
+                    st.rerun()
 
     with tab2:
-        st.subheader("Registrar salida")
+        st.subheader(f"Registrar salida – {hoy().strftime('%d/%m/%Y')}")
         opciones = emp_opciones(df_emp_fil)
         if not opciones:
             st.warning("No hay empleados registrados.")
@@ -889,18 +986,24 @@ def page_asistencia():
             else:
                 emp_id, nombre = list(opciones.values())[0]
                 st.info(f"👤 Registrando salida para: **{nombre}**")
-            fecha_sal = st.date_input("Fecha", hoy(), key="fecha_salida")
-            hora_sal  = st.time_input("Hora de salida", value=ahora().time(), key="hora_salida")
-            obs       = st.text_input("Observaciones (opcional)", key="obs_salida")
+            st.info(f"🕐 Hora actual en Ecuador: **{ahora().strftime('%H:%M')}**")
+            st.caption("La hora se toma automáticamente al registrar y no se puede "
+                       "modificar. La salida se registra sobre la entrada de hoy.")
+            obs = st.text_input("Observaciones (opcional)", key="obs_salida")
 
-            if st.button("📌 Registrar salida", type="primary"):
+            if st.button("📌 Registrar mi salida ahora", type="primary"):
+                momento = ahora()
                 try:
                     with st.spinner("Registrando…"):
-                        sm.registrar_salida(emp_id, fecha_sal.strftime("%Y-%m-%d"),
-                                            hora_sal.strftime("%H:%M"), obs)
-                    st.success(f"✅ Salida registrada para **{nombre}**")
+                        sm.registrar_salida(emp_id, hoy_str,
+                                            momento.strftime("%H:%M"), obs)
+                    flash("success", f"✅ Salida de **{nombre}** registrada a las "
+                                     f"{momento.strftime('%H:%M')}.")
+                    st.rerun()
                 except ValueError as e:
                     st.error(str(e))
+                    st.caption("Si no marcaste la entrada hoy, RRHH debe registrarla "
+                               "antes de poder marcar la salida.")
 
     with tab3:
         st.subheader("Historial de asistencia")
@@ -1020,6 +1123,21 @@ def page_configuracion():
             tard_suspension = st.number_input("Suspensión", min_value=1, max_value=30,
                 value=_cfg_int(config, "Tardanzas_Suspension", 8))
 
+        st.subheader("🏖️ Vacaciones")
+        st.caption("Días **calendario** (incluyen fines de semana), no días hábiles.")
+        v1, v2, v3 = st.columns(3)
+        with v1:
+            vac_base = st.number_input("Días por año", min_value=1, max_value=60,
+                value=_cfg_int(config, "Dias_Vacaciones_Base", 15))
+        with v2:
+            vac_desde = st.number_input("Año en que empieza el día adicional",
+                min_value=1, max_value=40,
+                value=_cfg_int(config, "Anio_Inicio_Dia_Adicional", 5),
+                help="Desde este año de servicio se suma un día por cada año más.")
+        with v3:
+            vac_techo = st.number_input("Máximo de días", min_value=1, max_value=90,
+                value=_cfg_int(config, "Max_Dias_Vacaciones", 30))
+
         if st.form_submit_button("💾 Guardar configuración", type="primary"):
             updates = {
                 "Horario_Inicio":              h_ini.strftime("%H:%M"),
@@ -1031,6 +1149,9 @@ def page_configuracion():
                 "Tardanzas_Llamado_Verbal":    str(tard_verbal),
                 "Tardanzas_Llamado_Escrito":   str(tard_escrito),
                 "Tardanzas_Suspension":        str(tard_suspension),
+                "Dias_Vacaciones_Base":        str(vac_base),
+                "Anio_Inicio_Dia_Adicional":   str(vac_desde),
+                "Max_Dias_Vacaciones":         str(vac_techo),
             }
             with st.spinner("Guardando…"):
                 try:
@@ -1254,6 +1375,11 @@ def tarjeta_aprobacion(sm, config, fila, tipo: str, etapa: str,
         elif etapa == "rrhh":
             st.caption("Sin registro de aprobación del jefe inmediato.")
 
+        if not email_emp:
+            st.warning("⚠️ Este empleado **no tiene correo** en su ficha, así que no "
+                       "recibirá el aviso de la aprobación. Complétalo en el módulo "
+                       "de Empleados.")
+
         if en_nombre_del_jefe:
             st.warning("Esta solicitud aún espera al jefe inmediato "
                        f"({email_jefe or 'sin correo asignado'}). "
@@ -1385,6 +1511,151 @@ def _tabla_estado(df, tipo: str):
     return out[[c for c in cols + extra if c in out.columns]]
 
 
+# ── Saldo de vacaciones ───────────────────────────────────────────────────────
+def _regla_vacaciones(config) -> str:
+    base  = _cfg_int(config, "Dias_Vacaciones_Base", 15)
+    desde = _cfg_int(config, "Anio_Inicio_Dia_Adicional", 5)
+    techo = _cfg_int(config, "Max_Dias_Vacaciones", 30)
+    return (f"**{base} días calendario** por cada año de servicio; a partir del año "
+            f"**{desde}** se suma un día por cada año adicional, hasta un máximo de "
+            f"**{techo}** días.")
+
+
+def panel_saldo(sm, config, emp_id, compacto: bool = False):
+    """Muestra el saldo de vacaciones de un empleado. Devuelve el dict del saldo."""
+    saldo = sm.saldo_vacaciones(emp_id, config)
+
+    if saldo["sin_fecha_ingreso"]:
+        st.warning("⚠️ No tienes fecha de ingreso registrada, así que todavía no se "
+                   "puede calcular tu saldo de vacaciones. Pídele a RRHH que la cargue.")
+        return saldo
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Días disponibles", f"{saldo['disponibles']:.1f}")
+    c2.metric("Ganados a la fecha", f"{saldo['acumulados']:.1f}")
+    c3.metric("Ya usados", f"{saldo['usados_total']:.1f}")
+
+    if not compacto:
+        with st.expander("🔍 Cómo se calcula este saldo"):
+            st.markdown(
+                f"- **Ingreso a la empresa:** {saldo['ingreso'].strftime('%d/%m/%Y')}\n"
+                f"- **Antigüedad:** {saldo['anios']:.2f} años\n"
+                f"- **Le corresponden este año:** {saldo['derecho_anio_actual']} días\n"
+                f"- **Ganados desde el ingreso:** {saldo['acumulados']:.1f} días "
+                f"(incluye la parte proporcional del año en curso)\n"
+                f"- **Días tomados antes del sistema:** {saldo['inicial']:.1f}\n"
+                f"- **Vacaciones aprobadas en el sistema:** {saldo['aprobados']:.1f}\n"
+                f"- **En trámite (aún sin aprobar):** {saldo['en_tramite']:.1f}\n\n"
+                f"**Disponibles = {saldo['acumulados']:.1f} − {saldo['usados_total']:.1f} "
+                f"= {saldo['disponibles']:.1f} días**")
+            st.caption("Regla: " + _regla_vacaciones(config))
+
+    if saldo["disponibles"] < 0:
+        st.error(f"⚠️ Saldo en negativo: se han tomado {abs(saldo['disponibles']):.1f} "
+                 "días más de los ganados.")
+    elif saldo["en_tramite"] > 0:
+        st.caption(f"ℹ️ Los {saldo['en_tramite']:.1f} día(s) en trámite ya están "
+                   "descontados del saldo disponible.")
+    return saldo
+
+
+def page_saldo_vacaciones():
+    sm = get_sm()
+    config = st.session_state.config
+    st.title("🏖️ Saldo de Vacaciones")
+    st.caption("Regla aplicada: " + _regla_vacaciones(config) +
+               " Se ajusta desde Configuración.")
+
+    et_tabla = "📊 Saldos del personal"
+    et_carga = "📥 Carga inicial por empleado"
+    seccion = secciones([et_tabla, et_carga], "sec_saldo_vac")
+    st.divider()
+
+    df_emp = sm.get_empleados()
+    if df_emp.empty:
+        st.warning("No hay empleados registrados.")
+        return
+
+    if seccion == et_tabla:
+        with st.spinner("Calculando saldos…"):
+            tabla = sm.tabla_saldos(config)
+        if tabla.empty:
+            st.info("No hay empleados para calcular.")
+            return
+
+        sin_fecha = tabla[tabla["Fecha_Ingreso"] == "—"]
+        if not sin_fecha.empty:
+            st.warning(f"⚠️ **{len(sin_fecha)}** empleado(s) sin fecha de ingreso. "
+                       "Hasta cargarla no se puede calcular su saldo.")
+            st.caption("Sin fecha: " + ", ".join(sin_fecha["Nombre"].astype(str).tolist()))
+
+        con_datos = tabla[tabla["Fecha_Ingreso"] != "—"]
+        if not con_datos.empty:
+            disp = pd.to_numeric(con_datos["Disponibles"], errors="coerce")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Empleados con saldo calculado", len(con_datos))
+            c2.metric("Días disponibles en total", f"{disp.sum():.0f}")
+            c3.metric("Con saldo negativo", int((disp < 0).sum()))
+
+        st.dataframe(tabla, use_container_width=True, hide_index=True)
+        st.caption("**Acumulados** = días ganados desde el ingreso · "
+                   "**Carga inicial** = días tomados antes de usar el sistema · "
+                   "**Disponibles** = acumulados − (carga inicial + aprobados + en trámite)")
+
+        csv = tabla.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Descargar saldos en CSV", csv,
+                           file_name=f"saldos_vacaciones_{hoy().strftime('%Y%m%d')}.csv",
+                           mime="text/csv")
+
+    else:
+        st.markdown("Carga la **fecha de ingreso** y los **días de vacaciones ya "
+                    "tomados** antes de que existiera el sistema. A partir de ahí, "
+                    "las solicitudes que se aprueben se descuentan solas.")
+
+        opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
+                    for _, r in df_emp.iterrows() if str(r["ID_Empleado"]).strip()}
+        if not opciones:
+            st.warning("No hay empleados registrados.")
+            return
+        sel = st.selectbox("Empleado", list(opciones.keys()), key="saldo_emp_sel")
+        emp_id = opciones[sel]
+        emp = sm.get_empleado(emp_id) or {}
+
+        st.divider()
+        panel_saldo(sm, config, emp_id)
+        st.divider()
+
+        ingreso_actual = sm._a_fecha(emp.get("Fecha_Ingreso"))
+        tomados_actual = sm._a_numero(emp.get("Dias_Tomados_Inicial"), 0.0)
+
+        with st.form("form_carga_vac"):
+            c1, c2 = st.columns(2)
+            with c1:
+                f_ingreso = st.date_input(
+                    "Fecha de ingreso a la empresa",
+                    value=ingreso_actual or hoy(),
+                    min_value=date(1970, 1, 1), max_value=hoy(),
+                    help="Fecha real de entrada. De aquí sale toda la antigüedad.")
+            with c2:
+                d_tomados = st.number_input(
+                    "Días ya tomados antes del sistema", min_value=0.0,
+                    max_value=999.0, step=0.5, value=float(tomados_actual),
+                    help="Solo los que NO están registrados como solicitudes aquí. "
+                         "Las vacaciones aprobadas en el sistema se descuentan aparte.")
+            if st.form_submit_button("💾 Guardar carga inicial", type="primary"):
+                try:
+                    with st.spinner("Guardando…"):
+                        sm.set_datos_vacaciones(emp_id, f_ingreso.strftime("%Y-%m-%d"),
+                                                d_tomados)
+                    flash("success", f"✅ Datos de vacaciones guardados para **{sel}**.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ No se pudo guardar: {e}")
+
+        if ingreso_actual is None:
+            st.info("Este empleado aún no tiene fecha de ingreso cargada.")
+
+
 # ── Módulo: Aprobaciones del jefe inmediato ──────────────────────────────────
 def page_aprobaciones_jefe():
     sm = get_sm()
@@ -1444,22 +1715,25 @@ def page_aprobaciones_jefe():
 
     firma = f"{usuario.get('nombre', '')}".strip()
 
-    t1, t2, t3 = st.tabs([f"📋 Permisos ({len(perm_pend)})",
-                          f"🏖️ Vacaciones ({len(vac_pend)})",
-                          "👥 Mi equipo"])
-    with t1:
+    et_perm = f"📋 Permisos ({len(perm_pend)})"
+    et_vac  = f"🏖️ Vacaciones ({len(vac_pend)})"
+    et_eq   = "👥 Mi equipo"
+    seccion = secciones([et_perm, et_vac, et_eq], "sec_aprob_jefe")
+    st.divider()
+
+    if seccion == et_perm:
         if perm_pend.empty:
             st.info("Sin permisos pendientes.")
         for _, fila in perm_pend.iterrows():
             tarjeta_aprobacion(sm, config, fila, "permiso", "jefe", firma)
 
-    with t2:
+    elif seccion == et_vac:
         if vac_pend.empty:
             st.info("Sin solicitudes de vacaciones pendientes.")
         for _, fila in vac_pend.iterrows():
             tarjeta_aprobacion(sm, config, fila, "vacacion", "jefe", firma)
 
-    with t3:
+    else:
         st.dataframe(equipo[[c for c in ("ID_Empleado", "Nombre", "Email", "Area")
                              if c in equipo.columns]],
                      use_container_width=True, hide_index=True)
@@ -1483,12 +1757,14 @@ def _page_permisos_con_rol():
         df_p = sm.get_permisos()
         pend_jefe = df_p[df_p["Estado"].astype(str) == EST_PEND_JEFE] if not df_p.empty else pd.DataFrame()
 
-        tabs = st.tabs([f"⏳ Para aprobar ({len(pend_rrhh)})",
-                        f"👤 Esperando al jefe ({len(pend_jefe)})",
-                        "📋 Historial",
-                        "➕ Nueva solicitud"])
+        et_apr  = f"⏳ Para aprobar ({len(pend_rrhh)})"
+        et_jefe = f"👤 Esperando al jefe ({len(pend_jefe)})"
+        et_hist = "📋 Historial"
+        et_new  = "➕ Nueva solicitud"
+        seccion = secciones([et_apr, et_jefe, et_hist, et_new], "sec_rrhh_permisos")
+        st.divider()
 
-        with tabs[0]:
+        if seccion == et_apr:
             if pend_rrhh.empty:
                 st.success("✅ No hay permisos esperando la firma de RRHH.")
             else:
@@ -1498,7 +1774,7 @@ def _page_permisos_con_rol():
                 for _, fila in pend_rrhh.iterrows():
                     tarjeta_aprobacion(sm, config, fila, "permiso", "rrhh", firma)
 
-        with tabs[1]:
+        elif seccion == et_jefe:
             if pend_jefe.empty:
                 st.success("✅ Ninguna solicitud está detenida en el jefe inmediato.")
             else:
@@ -1509,7 +1785,7 @@ def _page_permisos_con_rol():
                     tarjeta_aprobacion(sm, config, fila, "permiso", "jefe", firma,
                                        en_nombre_del_jefe=True)
 
-        with tabs[2]:
+        elif seccion == et_hist:
             if df_p.empty:
                 st.info("No hay solicitudes de permisos.")
             else:
@@ -1524,7 +1800,7 @@ def _page_permisos_con_rol():
                 st.dataframe(vista, use_container_width=True, hide_index=True)
                 st.caption(f"{len(df_pf)} solicitud(es)")
 
-        with tabs[3]:
+        else:
             st.info(f"ℹ️ Límite mensual: **{limite} horas por empleado**")
             opciones_a = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
                           for _, r in df_emp.iterrows()} if not df_emp.empty else {}
@@ -1643,12 +1919,14 @@ def _page_vacaciones_con_rol():
         df_v = sm.get_vacaciones()
         pend_jefe = df_v[df_v["Estado"].astype(str) == EST_PEND_JEFE] if not df_v.empty else pd.DataFrame()
 
-        tabs = st.tabs([f"⏳ Para aprobar ({len(pend_rrhh)})",
-                        f"👤 Esperando al jefe ({len(pend_jefe)})",
-                        "📋 Historial",
-                        "➕ Nueva solicitud"])
+        et_apr  = f"⏳ Para aprobar ({len(pend_rrhh)})"
+        et_jefe = f"👤 Esperando al jefe ({len(pend_jefe)})"
+        et_hist = "📋 Historial"
+        et_new  = "➕ Nueva solicitud"
+        seccion = secciones([et_apr, et_jefe, et_hist, et_new], "sec_rrhh_vac")
+        st.divider()
 
-        with tabs[0]:
+        if seccion == et_apr:
             if pend_rrhh.empty:
                 st.success("✅ No hay vacaciones esperando la firma de RRHH.")
             else:
@@ -1657,7 +1935,7 @@ def _page_vacaciones_con_rol():
                 for _, fila in pend_rrhh.iterrows():
                     tarjeta_aprobacion(sm, config, fila, "vacacion", "rrhh", firma)
 
-        with tabs[1]:
+        elif seccion == et_jefe:
             if pend_jefe.empty:
                 st.success("✅ Ninguna solicitud está detenida en el jefe inmediato.")
             else:
@@ -1668,7 +1946,7 @@ def _page_vacaciones_con_rol():
                     tarjeta_aprobacion(sm, config, fila, "vacacion", "jefe", firma,
                                        en_nombre_del_jefe=True)
 
-        with tabs[2]:
+        elif seccion == et_hist:
             if df_v.empty:
                 st.info("No hay solicitudes de vacaciones.")
             else:
@@ -1683,7 +1961,7 @@ def _page_vacaciones_con_rol():
                 st.dataframe(vista, use_container_width=True, hide_index=True)
                 st.caption(f"{len(df_vf)} solicitud(es)")
 
-        with tabs[3]:
+        else:
             opciones_a = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
                           for _, r in df_emp.iterrows()} if not df_emp.empty else {}
             if not opciones_a:
@@ -1716,6 +1994,10 @@ def _page_vacaciones_con_rol():
                 nombre_emp = str(emp.get("Nombre", emp_id))
                 jefe = sm.get_email_jefe(emp_id)
                 st.info(f"👤 Solicitud para: **{emp_id} – {nombre_emp}**")
+
+                saldo = panel_saldo(sm, config, emp_id)
+                st.divider()
+
                 if jefe:
                     st.caption(f"Tu solicitud irá primero a tu jefe inmediato ({jefe}) "
                                "y después a RRHH.")
@@ -1731,8 +2013,17 @@ def _page_vacaciones_con_rol():
                         if fecha_fin < fecha_ini:
                             st.error("La fecha de fin debe ser posterior a la de inicio.")
                         else:
-                            _crear_vacaciones(sm, config, emp_id, nombre_emp,
-                                              fecha_ini, fecha_fin, email_rrhh)
+                            pedidos = sm.dias_calendario(fecha_ini.strftime("%Y-%m-%d"),
+                                                         fecha_fin.strftime("%Y-%m-%d"))
+                            if (not saldo["sin_fecha_ingreso"]
+                                    and pedidos > saldo["disponibles"]):
+                                st.error(
+                                    f"❌ Estás pidiendo **{pedidos} días calendario** y "
+                                    f"solo tienes **{saldo['disponibles']:.1f} disponibles**. "
+                                    "Ajusta las fechas o consulta con RRHH.")
+                            else:
+                                _crear_vacaciones(sm, config, emp_id, nombre_emp,
+                                                  fecha_ini, fecha_fin, email_rrhh)
 
         with tab2:
             df_v = sm.get_vacaciones()
@@ -1760,6 +2051,7 @@ def _crear_vacaciones(sm, config, emp_id, nombre_emp, fecha_ini, fecha_fin, emai
     filas = [("Empleado", f"{emp_id} – {nombre_emp}"),
              ("Desde", fecha_ini.strftime("%d/%m/%Y")),
              ("Hasta", fecha_fin.strftime("%d/%m/%Y")),
+             ("Días calendario", res.get("dias_calendario", res["dias"])),
              ("Días hábiles", res["dias"])]
     cuerpo = (f"<p><strong>{esc(nombre_emp)}</strong> ha solicitado vacaciones.</p>"
               + tabla_html(filas)
@@ -2214,6 +2506,8 @@ def main():
         pantalla_login_empleado()
         return
 
+    registrar_entrada_automatica()
+
     page = sidebar()
 
     if es_admin():
@@ -2226,6 +2520,7 @@ def main():
             "Horas Extras":      _page_horas_extras_con_rol,
             "Configuración":     page_configuracion,
             "Gestión Usuarios":     page_gestion_usuarios,
+            "Saldo Vacaciones":     page_saldo_vacaciones,
             "Llamados de Atención": page_llamados_atencion,
             "Expediente":           page_expediente_empleado,
         }

@@ -54,7 +54,8 @@ SCOPES = [
 ]
 
 HEADERS = {
-    "Empleados":    ["ID_Empleado", "Nombre", "Email", "Area", "Email_Jefe", "Horario_Inicio", "Horario_Fin"],
+    "Empleados":    ["ID_Empleado", "Nombre", "Email", "Area", "Email_Jefe", "Horario_Inicio", "Horario_Fin",
+                     "Fecha_Ingreso", "Dias_Tomados_Inicial"],
     "Asistencia":   ["Fecha", "ID_Empleado", "Nombre", "Hora_Entrada", "Hora_Salida", "Estado", "Minutos_Atraso", "Observaciones"],
     "Permisos":     ["ID_Permiso", "Fecha", "ID_Empleado", "Horas_Solicitadas", "Motivo", "Estado",
                      "Horas_Usadas_Mes", "Aprobado_Por",
@@ -63,7 +64,7 @@ HEADERS = {
     "Vacaciones":   ["ID_Vacacion", "ID_Empleado", "Fecha_Inicio", "Fecha_Fin", "Dias_Habiles", "Estado",
                      "Aprobado_Por",
                      "Aprobado_Jefe", "Fecha_Aprob_Jefe", "Aprobado_RRHH", "Fecha_Aprob_RRHH",
-                     "Motivo_Rechazo", "Rechazado_Por"],
+                     "Motivo_Rechazo", "Rechazado_Por", "Dias_Calendario"],
     "Horas_Extras": ["ID", "Fecha", "ID_Empleado", "Horas_Extra", "Motivo", "Aprobado_Por", "Estado"],
     "Configuracion":["Key", "Valor"],
     "Usuarios":          ["ID_Empleado", "Password_Hash", "Rol"],
@@ -81,6 +82,11 @@ CONFIG_DEFAULTS = {
     "Tardanzas_Llamado_Verbal":    "3",
     "Tardanzas_Llamado_Escrito":   "5",
     "Tardanzas_Suspension":        "8",
+    # Vacaciones: 15 días calendario al año; desde el año indicado se suma un
+    # día por cada año adicional de antigüedad, con un techo.
+    "Dias_Vacaciones_Base":        "15",
+    "Anio_Inicio_Dia_Adicional":   "5",
+    "Max_Dias_Vacaciones":         "30",
 }
 
 # ── Estados del flujo de aprobación ───────────────────────────────────────────
@@ -307,7 +313,7 @@ class SheetsManager:
     def migrar_esquema(self):
         """Asegura que Permisos y Vacaciones tengan las columnas del flujo de
         doble aprobación. Es idempotente: si ya están, no hace nada."""
-        for hoja in ("Permisos", "Vacaciones"):
+        for hoja in ("Permisos", "Vacaciones", "Empleados"):
             try:
                 self.ensure_columns(hoja)
             except Exception:
@@ -392,14 +398,27 @@ class SheetsManager:
             return f"{prefix}{next_n:0{digits}d}"
         return f"EMP{next_n:03d}"
 
-    def agregar_empleado(self, nombre, email, area, email_jefe, hora_inicio, hora_fin) -> str:
+    def agregar_empleado(self, nombre, email, area, email_jefe, hora_inicio, hora_fin,
+                         fecha_ingreso="", dias_tomados_inicial=0) -> str:
         emp_id = self.next_id_empleado()
-        self.append("Empleados", [emp_id, nombre, email, area, email_jefe, hora_inicio, hora_fin])
+        self.append("Empleados", [emp_id, nombre, email, area, email_jefe,
+                                  hora_inicio, hora_fin, fecha_ingreso, dias_tomados_inicial])
         return emp_id
 
-    def actualizar_empleado(self, emp_id: str, nombre, email, area, email_jefe, hora_inicio, hora_fin):
+    def actualizar_empleado(self, emp_id: str, nombre, email, area, email_jefe,
+                            hora_inicio, hora_fin, fecha_ingreso="", dias_tomados_inicial=0):
         row_idx = self._fila_de("Empleados", "ID_Empleado", emp_id)
-        self.update_row("Empleados", row_idx, [emp_id, nombre, email, area, email_jefe, hora_inicio, hora_fin])
+        self.update_row("Empleados", row_idx, [emp_id, nombre, email, area, email_jefe,
+                                               hora_inicio, hora_fin, fecha_ingreso,
+                                               dias_tomados_inicial])
+
+    def set_datos_vacaciones(self, emp_id: str, fecha_ingreso, dias_tomados_inicial):
+        """Carga inicial: fecha de ingreso y días ya tomados antes del sistema."""
+        row_idx = self._fila_de("Empleados", "ID_Empleado", emp_id)
+        self.update_campos("Empleados", row_idx, {
+            "Fecha_Ingreso": fecha_ingreso,
+            "Dias_Tomados_Inicial": dias_tomados_inicial,
+        })
 
     # ── Jerarquía: jefe inmediato y subordinados ─────────────────────────────
 
@@ -619,6 +638,165 @@ class SheetsManager:
             current += timedelta(days=1)
         return dias
 
+
+    # ── Saldo de vacaciones ──────────────────────────────────────────────────
+    # Regla aplicada: 15 días CALENDARIO por cada año de servicio; a partir del
+    # quinto año se suma un día por cada año adicional, con techo de 30.
+    # Los tres números salen de Configuración, así que RRHH puede ajustarlos
+    # sin tocar el código.
+
+    @staticmethod
+    def _a_fecha(valor):
+        """Convierte a date lo que venga de la hoja, tolerando varios formatos."""
+        if valor is None:
+            return None
+        if isinstance(valor, datetime):
+            return valor.date()
+        if isinstance(valor, date):
+            return valor
+        txt = str(valor).strip()
+        if not txt or txt.lower() in ("nan", "none", ""):
+            return None
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%m/%d/%Y"):
+            try:
+                return datetime.strptime(txt[:10], fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _a_numero(valor, por_defecto=0.0) -> float:
+        txt = str(valor if valor is not None else "").strip().replace(",", ".")
+        if not txt or txt.lower() in ("nan", "none"):
+            return por_defecto
+        try:
+            return float(txt)
+        except ValueError:
+            return por_defecto
+
+    def dias_calendario(self, fecha_ini: str, fecha_fin: str) -> int:
+        """Días corridos incluyendo fines de semana y feriados: así se cuentan
+        las vacaciones por ley, a diferencia de los días hábiles."""
+        d0 = self._a_fecha(fecha_ini)
+        d1 = self._a_fecha(fecha_fin)
+        if not d0 or not d1:
+            return 0
+        return max(0, (d1 - d0).days + 1)
+
+    def anios_servicio(self, fecha_ingreso, referencia=None) -> float:
+        ini = self._a_fecha(fecha_ingreso)
+        if not ini:
+            return 0.0
+        ref = referencia or hoy_local()
+        return max(0.0, (ref - ini).days / 365.25)
+
+    def dias_derecho_del_anio(self, n_anio: int, config: dict) -> int:
+        """Días que corresponden por el n-ésimo año de servicio."""
+        base  = int(self._a_numero(config.get("Dias_Vacaciones_Base"), 15))
+        desde = int(self._a_numero(config.get("Anio_Inicio_Dia_Adicional"), 5))
+        techo = int(self._a_numero(config.get("Max_Dias_Vacaciones"), 30))
+        if n_anio < desde:
+            return base
+        return min(techo, base + (n_anio - desde) + 1)
+
+    def dias_acumulados(self, fecha_ingreso, config: dict, referencia=None) -> float:
+        """Días ganados desde el ingreso hasta hoy, incluyendo la parte
+        proporcional del año en curso."""
+        ini = self._a_fecha(fecha_ingreso)
+        if not ini:
+            return 0.0
+        ref = referencia or hoy_local()
+        if ref <= ini:
+            return 0.0
+        total, aniv, n = 0.0, ini, 1
+        while True:
+            try:
+                sig = aniv.replace(year=aniv.year + 1)
+            except ValueError:          # 29 de febrero
+                sig = aniv.replace(year=aniv.year + 1, day=28)
+            dias_n = self.dias_derecho_del_anio(n, config)
+            if sig <= ref:
+                total += dias_n
+                aniv, n = sig, n + 1
+            else:
+                largo = (sig - aniv).days
+                if largo > 0:
+                    total += dias_n * ((ref - aniv).days / largo)
+                break
+        return round(total, 1)
+
+    def _dias_de_solicitud(self, fila) -> float:
+        """Días calendario de una solicitud. Las solicitudes anteriores a este
+        cambio solo guardaron días hábiles, así que se recalculan por fechas."""
+        v = self._a_numero(fila.get("Dias_Calendario"), 0.0)
+        if v > 0:
+            return v
+        return float(self.dias_calendario(fila.get("Fecha_Inicio"),
+                                          fila.get("Fecha_Fin")))
+
+    def dias_vacaciones_usados(self, id_empleado: str) -> dict:
+        """Días ya usados: la carga inicial más lo aprobado y lo en trámite."""
+        emp = self.get_empleado(id_empleado) or {}
+        inicial = self._a_numero(emp.get("Dias_Tomados_Inicial"), 0.0)
+        aprobados = en_tramite = 0.0
+        df = self.get_vacaciones()
+        if not df.empty and "ID_Empleado" in df.columns:
+            mias = df[df["ID_Empleado"].astype(str).str.strip() == str(id_empleado).strip()]
+            for _, r in mias.iterrows():
+                estado = str(r.get("Estado", "")).strip()
+                dias = self._dias_de_solicitud(r)
+                if estado == EST_APROBADO:
+                    aprobados += dias
+                elif estado in (EST_PEND_JEFE, EST_PEND_RRHH, "Pendiente"):
+                    en_tramite += dias
+        return {"inicial": inicial, "aprobados": aprobados, "en_tramite": en_tramite,
+                "usados_total": inicial + aprobados + en_tramite}
+
+    def saldo_vacaciones(self, id_empleado: str, config: dict) -> dict:
+        """Resumen completo del derecho a vacaciones de un empleado."""
+        emp = self.get_empleado(id_empleado) or {}
+        ingreso = self._a_fecha(emp.get("Fecha_Ingreso"))
+        usados = self.dias_vacaciones_usados(id_empleado)
+        base = {"nombre": str(emp.get("Nombre", id_empleado)),
+                "ingreso": ingreso, **usados}
+        if not ingreso:
+            return {**base, "sin_fecha_ingreso": True, "anios": 0.0,
+                    "acumulados": 0.0, "disponibles": 0.0, "derecho_anio_actual": 0}
+        anios = self.anios_servicio(ingreso)
+        acumulados = self.dias_acumulados(ingreso, config)
+        return {**base, "sin_fecha_ingreso": False, "anios": round(anios, 2),
+                "acumulados": acumulados,
+                "disponibles": round(acumulados - usados["usados_total"], 1),
+                "derecho_anio_actual": self.dias_derecho_del_anio(int(anios) + 1, config)}
+
+    def tabla_saldos(self, config: dict) -> pd.DataFrame:
+        """Saldo de vacaciones de todos los empleados."""
+        df = self.get_empleados()
+        if df.empty:
+            return pd.DataFrame()
+        filas = []
+        for _, r in df.iterrows():
+            eid = str(r["ID_Empleado"]).strip()
+            if not eid:
+                continue
+            s = self.saldo_vacaciones(eid, config)
+            sf = s["sin_fecha_ingreso"]
+            # Todo va como texto: mezclar números con "—" en una misma columna
+            # rompe la serialización de la tabla en Streamlit.
+            filas.append({
+                "ID_Empleado": eid,
+                "Nombre": s["nombre"],
+                "Fecha_Ingreso": s["ingreso"].strftime("%d/%m/%Y") if s["ingreso"] else "—",
+                "Años": "—" if sf else f"{s['anios']:.1f}",
+                "Derecho_año_actual": "—" if sf else str(s["derecho_anio_actual"]),
+                "Acumulados": "—" if sf else f"{s['acumulados']:.1f}",
+                "Carga_inicial": f"{s['inicial']:.1f}",
+                "Aprobados": f"{s['aprobados']:.1f}",
+                "En_trámite": f"{s['en_tramite']:.1f}",
+                "Disponibles": "—" if sf else f"{s['disponibles']:.1f}",
+            })
+        return pd.DataFrame(filas)
+
     def solicitar_vacaciones(self, id_empleado: str, fecha_ini: str, fecha_fin: str) -> dict:
         """Crea la solicitud de vacaciones. Requiere aprobación del jefe
         inmediato (si está asignado) y luego de RRHH.
@@ -626,14 +804,16 @@ class SheetsManager:
         Devuelve {"id", "estado", "dias", "email_jefe"}.
         """
         dias = self.dias_habiles(fecha_ini, fecha_fin)
+        dias_cal = self.dias_calendario(fecha_ini, fecha_fin)
         email_jefe = self.get_email_jefe(id_empleado)
         estado = EST_PEND_JEFE if email_jefe else EST_PEND_RRHH
 
         vac_id = self._next_id("Vacaciones", "ID_Vacacion", "VAC")
         fila = [vac_id, id_empleado, fecha_ini, fecha_fin, dias, estado,
-                "", "", "", "", "", "", ""]
+                "", "", "", "", "", "", "", dias_cal]
         self.append("Vacaciones", fila)
-        return {"id": vac_id, "estado": estado, "dias": dias, "email_jefe": email_jefe}
+        return {"id": vac_id, "estado": estado, "dias": dias,
+                "dias_calendario": dias_cal, "email_jefe": email_jefe}
 
     def aprobar_vacaciones_jefe(self, vac_id: str, aprobador: str):
         row = self._fila_de("Vacaciones", "ID_Vacacion", vac_id)

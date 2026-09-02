@@ -12,6 +12,38 @@ import hashlib
 import hmac
 import os
 import base64
+import time
+from zoneinfo import ZoneInfo
+
+# Segundos que se reutiliza una lectura de una hoja antes de volver a pedirla.
+# Google Sheets limita a ~60 lecturas por minuto y por usuario; sin esta caché
+# una sola pantalla puede gastar 5 o 6 lecturas y agotar la cuota.
+_CACHE_TTL = 15
+
+ZONA_POR_DEFECTO = "America/Guayaquil"
+
+
+def zona_horaria(config: dict | None = None) -> ZoneInfo:
+    """Zona horaria configurada (America/Guayaquil por defecto)."""
+    nombre = (config or {}).get("Zona_Horaria", ZONA_POR_DEFECTO) or ZONA_POR_DEFECTO
+    try:
+        return ZoneInfo(nombre)
+    except Exception:
+        return ZoneInfo(ZONA_POR_DEFECTO)
+
+
+def ahora_local(config: dict | None = None) -> datetime:
+    """Fecha y hora actuales en la zona horaria de la empresa.
+
+    Importante: el servidor de Streamlit Cloud corre en UTC, así que
+    datetime.now() devuelve una hora cinco horas adelantada respecto a Ecuador.
+    Todo registro de asistencia debe pasar por aquí."""
+    return datetime.now(zona_horaria(config))
+
+
+def hoy_local(config: dict | None = None) -> date:
+    """Fecha de hoy en la zona horaria de la empresa."""
+    return ahora_local(config).date()
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 SPREADSHEET_ID = "1gaPrP95SF0xat7xRs94CMyH22LeIoolEom1OjCDAA2I"
@@ -140,18 +172,44 @@ class SheetsManager:
 
         self.client = gspread.authorize(creds)
         self.spreadsheet = self.client.open_by_key(SPREADSHEET_ID)
+        # Caché de lecturas y último error de lectura, para no confundir un
+        # fallo de la API con "no hay datos".
+        self._cache = {}
+        self.ultimo_error = None
 
     # ── Helpers de bajo nivel ────────────────────────────────────────────────
 
     def _sheet(self, name: str):
         return self.spreadsheet.worksheet(name)
 
-    def get_df(self, sheet_name: str) -> pd.DataFrame:
-        """Lee la hoja y devuelve DataFrame. Normaliza nombres de columnas."""
+    def _invalidar_cache(self, sheet_name: str = None):
+        """Descarta la lectura guardada tras escribir en una hoja."""
+        if sheet_name:
+            self._cache.pop(sheet_name, None)
+        else:
+            self._cache.clear()
+
+    def get_df(self, sheet_name: str, usar_cache: bool = True) -> pd.DataFrame:
+        """Lee la hoja y devuelve DataFrame. Normaliza nombres de columnas.
+
+        Reutiliza la última lectura durante _CACHE_TTL segundos: una sola
+        pantalla puede consultar la misma hoja varias veces y Google Sheets
+        corta el acceso al pasarse de cuota.
+        """
+        if usar_cache:
+            guardado = self._cache.get(sheet_name)
+            if guardado and (time.time() - guardado[0]) < _CACHE_TTL:
+                return guardado[1].copy()
+
         try:
             records = self._sheet(sheet_name).get_all_records()
-        except Exception:
-            records = []
+            self.ultimo_error = None
+        except Exception as e:
+            # Se guarda el error en vez de silenciarlo: antes, una cuota
+            # agotada de la API se veía en pantalla como "no hay datos".
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            return pd.DataFrame(columns=HEADERS[sheet_name])
+
         if records:
             df = pd.DataFrame(records)
             # Normalizar columnas al formato esperado (case-insensitive)
@@ -167,16 +225,21 @@ class SheetsManager:
             for exp in expected:
                 if exp not in df.columns:
                     df[exp] = ""
-            return df
-        return pd.DataFrame(columns=HEADERS[sheet_name])
+        else:
+            df = pd.DataFrame(columns=HEADERS[sheet_name])
+
+        self._cache[sheet_name] = (time.time(), df)
+        return df.copy()
 
     def append(self, sheet_name: str, row: list):
         """Agrega una fila al final de la hoja."""
         self._sheet(sheet_name).append_row(row, value_input_option="USER_ENTERED")
+        self._invalidar_cache(sheet_name)
 
     def update_cell(self, sheet_name: str, row: int, col: int, value):
         """Actualiza una celda (row/col base 1, fila 1 = encabezado)."""
         self._sheet(sheet_name).update_cell(row, col, value)
+        self._invalidar_cache(sheet_name)
 
     def update_row(self, sheet_name: str, row_idx: int, data: list):
         """Actualiza la fila completa (row_idx base 1, fila 1 = encabezado)."""
@@ -184,6 +247,7 @@ class SheetsManager:
         rango = f"A{row_idx}:{rowcol_to_a1(row_idx, ncols)}"
         self._sheet(sheet_name).update(range_name=rango, values=[data],
                                        value_input_option="USER_ENTERED")
+        self._invalidar_cache(sheet_name)
 
     def update_campos(self, sheet_name: str, row_idx: int, campos: dict):
         """Actualiza varias columnas por nombre en una sola llamada a la API.
@@ -200,6 +264,7 @@ class SheetsManager:
             })
         if peticiones:
             self._sheet(sheet_name).batch_update(peticiones, value_input_option="USER_ENTERED")
+            self._invalidar_cache(sheet_name)
 
     def _fila_de(self, sheet_name: str, id_col: str, id_val: str) -> int:
         """Devuelve el índice base-1 de la fila cuyo id_col == id_val."""
@@ -271,6 +336,7 @@ class SheetsManager:
         sheet = self._sheet("Configuracion")
         rows = [["Key", "Valor"]] + [[k, str(v)] for k, v in config.items()]
         sheet.clear()
+        self._invalidar_cache("Configuracion")
         result = sheet.update(range_name=f"A1:B{len(rows)}", values=rows,
                               value_input_option="USER_ENTERED")
         updated = (result or {}).get("updatedRows", 0)
@@ -406,7 +472,7 @@ class SheetsManager:
 
     def registrar_entrada(self, id_empleado: str, nombre: str, hora_entrada: str, config: dict) -> tuple:
         """Registra la hora de entrada. Devuelve (estado, minutos_atraso)."""
-        fecha = date.today().strftime("%Y-%m-%d")
+        fecha = hoy_local(config).strftime("%Y-%m-%d")
         horario_inicio = config.get("Horario_Inicio", "09:00")
         tolerancia = int(float(config.get("Tolerancia_Minutos", 0)))
 
@@ -494,7 +560,7 @@ class SheetsManager:
         self.update_campos("Permisos", row, {
             "Estado":           EST_PEND_RRHH,
             "Aprobado_Jefe":    aprobador,
-            "Fecha_Aprob_Jefe": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Fecha_Aprob_Jefe": ahora_local().strftime("%Y-%m-%d %H:%M"),
         })
 
     def aprobar_permiso_rrhh(self, perm_id: str, aprobador: str):
@@ -503,7 +569,7 @@ class SheetsManager:
         self.update_campos("Permisos", row, {
             "Estado":           EST_APROBADO,
             "Aprobado_RRHH":    aprobador,
-            "Fecha_Aprob_RRHH": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Fecha_Aprob_RRHH": ahora_local().strftime("%Y-%m-%d %H:%M"),
             "Aprobado_Por":     aprobador,
         })
 
@@ -574,7 +640,7 @@ class SheetsManager:
         self.update_campos("Vacaciones", row, {
             "Estado":           EST_PEND_RRHH,
             "Aprobado_Jefe":    aprobador,
-            "Fecha_Aprob_Jefe": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Fecha_Aprob_Jefe": ahora_local().strftime("%Y-%m-%d %H:%M"),
         })
 
     def aprobar_vacaciones_rrhh(self, vac_id: str, aprobador: str):
@@ -582,7 +648,7 @@ class SheetsManager:
         self.update_campos("Vacaciones", row, {
             "Estado":           EST_APROBADO,
             "Aprobado_RRHH":    aprobador,
-            "Fecha_Aprob_RRHH": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Fecha_Aprob_RRHH": ahora_local().strftime("%Y-%m-%d %H:%M"),
             "Aprobado_Por":     aprobador,
         })
 
@@ -722,7 +788,7 @@ class SheetsManager:
 
     def registrar_llamado_atencion(self, id_empleado: str, nombre: str, tipo: str,
                                     motivo: str, atrasos: int, registrado_por: str) -> str:
-        año = date.today().year
+        año = hoy_local().year
         df = self.get_llamados_atencion()
         if not df.empty and "ID_Llamado" in df.columns:
             este_año = df[df["ID_Llamado"].astype(str).str.startswith(f"LA-{año}-")]
@@ -734,7 +800,7 @@ class SheetsManager:
         else:
             next_n = 1
         llamado_id = f"LA-{año}-{next_n:04d}"
-        fecha = date.today().strftime("%Y-%m-%d")
+        fecha = hoy_local().strftime("%Y-%m-%d")
         self.append("Llamados_Atencion",
                     [llamado_id, fecha, id_empleado, nombre, tipo, motivo, atrasos, registrado_por, "Activo"])
         return llamado_id

@@ -10,7 +10,7 @@ import json
 from datetime import date, datetime, timedelta
 import html as _html
 from sheets_manager import (
-    SheetsManager, CONFIG_DEFAULTS,
+    SheetsManager, CONFIG_DEFAULTS, ahora_local, hoy_local,
     EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO,
     password_debil,
 )
@@ -34,6 +34,52 @@ def leer_secrets(seccion: str):
     except Exception:
         return None
     return None
+
+
+def flash(tipo: str, mensaje: str):
+    """Guarda un mensaje para mostrarlo DESPUÉS del st.rerun().
+
+    st.success() seguido de st.rerun() no se alcanza a leer: la recarga borra
+    la pantalla de inmediato y da la sensación de que el sistema "se salió".
+    """
+    st.session_state.setdefault("flash", []).append((tipo, mensaje))
+
+
+def mostrar_flash():
+    """Pinta arriba de la página los mensajes dejados antes de la recarga."""
+    for tipo, mensaje in st.session_state.pop("flash", []):
+        getattr(st, tipo, st.info)(mensaje)
+
+
+def aviso_sin_perfil(sm, emp_id):
+    """Explica por qué no se encontró el perfil, sin confundir un fallo de
+    lectura de Google Sheets con una ficha inexistente."""
+    detalle = getattr(sm, "ultimo_error", None)
+    if detalle:
+        st.error("❌ No se pudo leer la hoja de Empleados en este momento. "
+                 "Tu perfil sí puede existir.")
+        if "429" in detalle or "quota" in detalle.lower() or "Quota" in detalle:
+            st.info("Se superó el límite de consultas por minuto de Google Sheets. "
+                    "Espera un minuto y vuelve a cargar la página.")
+        with st.expander("🔍 Detalle técnico"):
+            st.code(detalle, language=None)
+    else:
+        st.warning(f"No se encontró tu ficha de empleado con el ID **{emp_id}**.")
+        st.caption("Avisa a RRHH: tu ID de usuario debe coincidir exactamente con "
+                   "el ID_Empleado de tu fila en la hoja Empleados.")
+
+
+def ahora():
+    """Hora actual en Ecuador (o la zona configurada).
+
+    El servidor de Streamlit Cloud corre en UTC: usar ahora() marcaba
+    las entradas cinco horas adelantadas."""
+    return ahora_local(st.session_state.get("config") or {})
+
+
+def hoy():
+    """Fecha de hoy en Ecuador (o la zona configurada)."""
+    return hoy_local(st.session_state.get("config") or {})
 
 # ── Configuración de página ───────────────────────────────────────────────────
 st.set_page_config(
@@ -242,11 +288,14 @@ def es_jefe() -> bool:
     u = get_usuario()
     if not u:
         return False
-    if "es_jefe" not in u:
-        sm = get_sm()
-        correo = email_usuario_actual()
-        u["es_jefe"] = bool(sm and correo and sm.es_jefe(correo))
-    return bool(u["es_jefe"])
+    sm = get_sm()
+    correo = email_usuario_actual()
+    if not (sm and correo):
+        return False
+    # Sin memoria entre recargas: si RRHH acaba de asignarle gente a cargo,
+    # el módulo de aprobaciones debe aparecer sin cerrar sesión. La caché de
+    # lecturas de SheetsManager evita que esto cueste una consulta cada vez.
+    return sm.es_jefe(correo)
 
 
 def esc(texto) -> str:
@@ -346,44 +395,75 @@ def conectar_sheets(creds_dict: dict):
 
 # ── Pantalla de login / credenciales ─────────────────────────────────────────
 def pantalla_login():
+    """Pantalla previa a la conexión con Google Sheets.
+
+    En producción NO debería verse nunca: el aplicativo se conecta solo con la
+    cuenta de servicio guardada en los Secrets de Streamlit. Si un empleado
+    llega aquí es que falta esa configuración, y pedirle un archivo de
+    credenciales que no tiene (ni debe tener) no es la solución.
+    """
     col_center = st.columns([1, 2, 1])[1]
     with col_center:
         st.image("https://www.quski.ec/wp-content/uploads/2022/08/logo-quski.png",
                  width=180, use_container_width=False)
-    st.markdown("<h2 style='text-align:center'>Sistema de Asistencia RRHH</h2>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align:center;color:#6B7280'>Conecta tu cuenta de Google Service Account para continuar</p>",
+    st.markdown("<h2 style='text-align:center'>Sistema de Asistencia RRHH</h2>",
                 unsafe_allow_html=True)
     st.divider()
 
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        uploaded = st.file_uploader(
-            "📂 Sube el archivo credentials.json (Service Account)",
-            type=["json"],
-            help="Descarga el JSON de tu Service Account en Google Cloud Console y compártelo con el spreadsheet."
+        st.error("⚠️ **El sistema no está conectado a la base de datos.**")
+        st.markdown(
+            "Esto **no es un problema de tu usuario** y no necesitas ningún "
+            "archivo. Avisa al área de RRHH para que termine la configuración; "
+            "mientras tanto no podrás ingresar."
         )
-        if uploaded:
-            try:
-                creds_dict = json.load(uploaded)
-                if st.button("🔗 Conectar a Google Sheets", use_container_width=True, type="primary"):
-                    with st.spinner("Conectando…"):
-                        if conectar_sheets(creds_dict):
-                            st.success("✅ Conexión exitosa")
-                            st.rerun()
-            except Exception:
-                st.error("Archivo JSON inválido. Verifica que sea el credentials.json correcto.")
+
+        detalle = st.session_state.get("error_conexion")
+        if detalle:
+            with st.expander("🔍 Detalle técnico (para RRHH o sistemas)"):
+                st.code(detalle, language=None)
 
         st.markdown("---")
-        with st.expander("ℹ️ ¿Cómo obtener las credenciales?"):
-            st.markdown("""
-1. Ve a [Google Cloud Console](https://console.cloud.google.com)
-2. Crea o selecciona un proyecto
-3. Activa **Google Sheets API** y **Google Drive API**
-4. En *IAM & Admin → Service Accounts*, crea una cuenta de servicio
-5. Genera una clave JSON y descárgala
-6. Comparte el spreadsheet con el email del Service Account (permisos de Editor)
-7. Sube el JSON aquí
-            """)
+        with st.expander("🔐 Soy administrador del sistema"):
+            st.markdown(
+                "**Solución permanente** — para que nadie más vuelva a ver esta "
+                "pantalla, carga la cuenta de servicio en los Secrets:\n\n"
+                "1. En Streamlit Cloud abre *Manage app → Settings → Secrets*.\n"
+                "2. Pega el contenido del `credentials.json` con este formato "
+                "(respetando los `\\n` de la clave privada).\n"
+                "3. Guarda y haz *Reboot app*."
+            )
+            st.code('''[gcp_service_account]
+type                        = "service_account"
+project_id                  = "tu-proyecto"
+private_key_id              = "..."
+private_key                 = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
+client_email                = "...@....iam.gserviceaccount.com"
+client_id                   = "..."
+auth_uri                    = "https://accounts.google.com/o/oauth2/auth"
+token_uri                   = "https://oauth2.googleapis.com/token"
+auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
+client_x509_cert_url        = "..."''', language="toml")
+            st.caption("El spreadsheet debe estar compartido como Editor con ese "
+                       "`client_email`.")
+
+            st.markdown("---")
+            st.markdown("**Conexión temporal** (solo para esta sesión):")
+            uploaded = st.file_uploader(
+                "Subir credentials.json", type=["json"],
+                help="Solo destraba tu propia sesión. No arregla el problema "
+                     "para el resto del equipo: para eso hay que usar los Secrets.")
+            if uploaded:
+                try:
+                    creds_dict = json.load(uploaded)
+                    if st.button("🔗 Conectar", use_container_width=True, type="primary"):
+                        with st.spinner("Conectando…"):
+                            if conectar_sheets(creds_dict):
+                                st.success("✅ Conexión exitosa")
+                                st.rerun()
+                except Exception:
+                    st.error("Archivo JSON inválido.")
 
 
 # ── Primer arranque: creación del administrador ──────────────────────────────
@@ -453,7 +533,7 @@ def pantalla_login_empleado():
 
         if submitted:
             bloqueado_hasta = st.session_state.get("login_bloqueado_hasta")
-            ahora = datetime.now()
+            ahora = ahora()
 
             if bloqueado_hasta and ahora < bloqueado_hasta:
                 restante = int((bloqueado_hasta - ahora).total_seconds())
@@ -540,9 +620,10 @@ def sidebar():
                 "🔑  Cambiar Contraseña",
             ]
 
-        page = st.selectbox("Módulo", options=options, label_visibility="collapsed")
+        page = st.selectbox("Módulo", options=options, label_visibility="collapsed",
+                            key="nav_modulo")
         st.markdown("---")
-        st.caption(f"📅 {date.today().strftime('%d/%m/%Y')}")
+        st.caption(f"📅 {hoy().strftime('%d/%m/%Y')}")
         if st.button("🔒 Cerrar sesión", use_container_width=True):
             st.session_state.usuario = None
             st.rerun()
@@ -584,8 +665,8 @@ def df_con_badges(df: pd.DataFrame, col_estado: str = "Estado") -> pd.DataFrame:
 def page_dashboard():
     sm = get_sm()
     st.title("🏠 Dashboard")
-    hoy = date.today().strftime("%Y-%m-%d")
-    mes = date.today().strftime("%Y-%m")
+    hoy = hoy().strftime("%Y-%m-%d")
+    mes = hoy().strftime("%Y-%m")
 
     try:
         emp_df  = sm.get_empleados()
@@ -758,7 +839,7 @@ def page_asistencia():
     tab4 = tab_list[3] if admin else None
 
     df_emp = sm.get_empleados()
-    hoy = date.today().strftime("%Y-%m-%d")
+    hoy = hoy().strftime("%Y-%m-%d")
 
     # Filtrar empleados según rol
     if not admin and usuario:
@@ -772,7 +853,7 @@ def page_asistencia():
                 for _, r in df.iterrows()}
 
     with tab1:
-        st.subheader(f"Registrar entrada – {date.today().strftime('%d/%m/%Y')}")
+        st.subheader(f"Registrar entrada – {hoy().strftime('%d/%m/%Y')}")
         opciones = emp_opciones(df_emp_fil)
         if not opciones:
             st.warning("No hay empleados registrados.")
@@ -783,7 +864,7 @@ def page_asistencia():
             else:
                 emp_id, nombre = list(opciones.values())[0]
                 st.info(f"👤 Registrando asistencia para: **{nombre}**")
-            hora = st.time_input("Hora de entrada", value=datetime.now().time(), key="hora_entrada")
+            hora = st.time_input("Hora de entrada", value=ahora().time(), key="hora_entrada")
 
             if st.button("📌 Registrar entrada", type="primary"):
                 if sm.ya_registro_entrada(emp_id, hoy):
@@ -808,8 +889,8 @@ def page_asistencia():
             else:
                 emp_id, nombre = list(opciones.values())[0]
                 st.info(f"👤 Registrando salida para: **{nombre}**")
-            fecha_sal = st.date_input("Fecha", date.today(), key="fecha_salida")
-            hora_sal  = st.time_input("Hora de salida", value=datetime.now().time(), key="hora_salida")
+            fecha_sal = st.date_input("Fecha", hoy(), key="fecha_salida")
+            hora_sal  = st.time_input("Hora de salida", value=ahora().time(), key="hora_salida")
             obs       = st.text_input("Observaciones (opcional)", key="obs_salida")
 
             if st.button("📌 Registrar salida", type="primary"):
@@ -825,9 +906,9 @@ def page_asistencia():
         st.subheader("Historial de asistencia")
         c1, c2 = st.columns(2)
         with c1:
-            fecha_desde = st.date_input("Desde", date.today().replace(day=1))
+            fecha_desde = st.date_input("Desde", hoy().replace(day=1))
         with c2:
-            fecha_hasta = st.date_input("Hasta", date.today())
+            fecha_hasta = st.date_input("Hasta", hoy())
 
         df_asis = sm.get_df("Asistencia")
         if not df_asis.empty:
@@ -868,7 +949,7 @@ def page_asistencia():
             else:
                 sel = st.selectbox("Empleado", list(opciones.keys()), key="aus_emp")
                 emp_id, nombre = opciones[sel]
-                fecha_aus = st.date_input("Fecha de ausencia", date.today())
+                fecha_aus = st.date_input("Fecha de ausencia", hoy())
                 motivo_aus = st.text_area("Motivo de ausencia")
                 if st.button("📌 Registrar ausencia", type="primary"):
                     with st.spinner("Registrando…"):
@@ -1234,7 +1315,8 @@ def _procesar_aprobacion(sm, config, d, tipo, etapa, aprobador,
     filas = d["detalle"] + [("Aprobado por", aprobador)]
 
     if final:
-        st.success(f"✅ {d['asunto'].capitalize()} **{d['id']}** aprobado en firme.")
+        msg_ok = (f"✅ {d['asunto'].capitalize()} **{d['id']}** de "
+                  f"**{d['nombre']}** aprobado en firme.")
         cuerpo = (f"<p>La solicitud de <strong>{esc(d['asunto'])}</strong> de "
                   f"<strong>{esc(d['nombre'])}</strong> quedó "
                   f"<strong style='color:#065F46'>APROBADA</strong> por RRHH.</p>"
@@ -1242,8 +1324,8 @@ def _procesar_aprobacion(sm, config, d, tipo, etapa, aprobador,
         destinos = [email_emp, email_jefe, email_rrhh]
         asunto = f"{d['asunto'].capitalize()} aprobado – {d['nombre']}"
     else:
-        st.success(f"✅ Aprobación del jefe registrada. "
-                   f"La solicitud **{d['id']}** pasa a revisión de RRHH.")
+        msg_ok = (f"✅ Aprobación registrada para **{d['id']}** "
+                  f"({d['nombre']}). Pasa a revisión de RRHH.")
         cuerpo = (f"<p>El jefe inmediato aprobó la solicitud de "
                   f"<strong>{esc(d['asunto'])}</strong> de "
                   f"<strong>{esc(d['nombre'])}</strong>. "
@@ -1252,8 +1334,13 @@ def _procesar_aprobacion(sm, config, d, tipo, etapa, aprobador,
         destinos = [email_rrhh, email_emp]
         asunto = f"Pendiente de RRHH: {d['asunto']} – {d['nombre']}"
 
-    enviados, fallidos = notificar(destinos, asunto, cuerpo)
-    mostrar_envio(enviados, fallidos)
+    with st.spinner("Enviando notificaciones…"):
+        enviados, fallidos = notificar(destinos, asunto, cuerpo)
+    flash("success", msg_ok)
+    if enviados:
+        flash("info", "📧 Notificado a: " + ", ".join(enviados))
+    if fallidos:
+        flash("warning", "⚠️ No se pudo notificar a: " + ", ".join(fallidos))
     st.rerun()
 
 
@@ -1269,16 +1356,18 @@ def _procesar_rechazo(sm, config, d, tipo, quien, motivo,
         st.error(f"❌ No se pudo registrar el rechazo: {e}")
         return
 
-    st.warning(f"Solicitud **{d['id']}** rechazada.")
     cuerpo = (f"<p>La solicitud de <strong>{esc(d['asunto'])}</strong> de "
               f"<strong>{esc(d['nombre'])}</strong> fue "
               f"<strong style='color:#991B1B'>RECHAZADA</strong>.</p>"
               + tabla_html(d["detalle"] + [("Rechazada por", quien),
                                            ("Motivo del rechazo", motivo)]))
-    enviados, fallidos = notificar([email_emp, email_jefe, email_rrhh],
-                                   f"{d['asunto'].capitalize()} rechazado – {d['nombre']}",
-                                   cuerpo)
-    mostrar_envio(enviados, fallidos)
+    with st.spinner("Enviando notificaciones…"):
+        enviados, fallidos = notificar([email_emp, email_jefe, email_rrhh],
+                                       f"{d['asunto'].capitalize()} rechazado – {d['nombre']}",
+                                       cuerpo)
+    flash("warning", f"Solicitud **{d['id']}** de {d['nombre']} rechazada.")
+    if enviados:
+        flash("info", "📧 Notificado a: " + ", ".join(enviados))
     st.rerun()
 
 
@@ -1307,7 +1396,40 @@ def page_aprobaciones_jefe():
 
     equipo = sm.get_subordinados(correo)
     if equipo.empty:
+        # No basta con decir "no hay nadie a tu cargo": casi siempre es que el
+        # correo de la ficha no coincide con el que se escribió en Email_Jefe.
+        # Se muestra contra qué se comparó para que RRHH lo corrija de una vez.
+        if getattr(sm, "ultimo_error", None):
+            st.error("❌ No se pudo leer la hoja de Empleados en este momento.")
+            with st.expander("🔍 Detalle técnico"):
+                st.code(sm.ultimo_error, language=None)
+            return
+
         st.info("No hay empleados asignados a tu cargo.")
+        with st.expander("🔍 ¿Por qué? Revisar la asignación de jefes", expanded=True):
+            if not correo:
+                st.warning("Tu ficha de empleado no tiene correo en la columna "
+                           "**Email**, así que nadie puede tenerte como jefe.")
+                st.caption("Pídele a RRHH que complete tu correo en la hoja Empleados.")
+                return
+            st.markdown(f"Se buscaron empleados cuya columna **Email_Jefe** sea "
+                        f"exactamente `{correo}`.")
+            df_todos = sm.get_empleados()
+            if "Email_Jefe" in df_todos.columns and not df_todos.empty:
+                jefes = (df_todos["Email_Jefe"].astype(str).str.strip()
+                         .replace({"": None, "nan": None, "None": None}).dropna().unique())
+                if len(jefes):
+                    st.markdown("**Correos de jefe registrados hoy en la hoja:**")
+                    for j in sorted(jefes):
+                        marca = "✅" if j.strip().lower() == correo.strip().lower() else "▫️"
+                        st.markdown(f"{marca} `{j}`")
+                    st.caption("Si tu correo aparece escrito distinto (mayúsculas, "
+                               "espacios, otro dominio), corrígelo en la hoja Empleados "
+                               "para que coincida con el de tu ficha.")
+                else:
+                    st.warning("Ningún empleado tiene la columna **Email_Jefe** "
+                               "completa. Mientras esté vacía, todas las solicitudes "
+                               "van directo a RRHH sin pasar por el jefe.")
         return
     st.caption(f"Tienes **{len(equipo)}** persona(s) a cargo.")
 
@@ -1411,7 +1533,7 @@ def _page_permisos_con_rol():
             else:
                 with st.form("form_permiso_admin", clear_on_submit=True):
                     sel = st.selectbox("Empleado", list(opciones_a.keys()))
-                    fecha_p  = st.date_input("Fecha del permiso", date.today())
+                    fecha_p  = st.date_input("Fecha del permiso", hoy())
                     horas_p  = st.number_input("Horas solicitadas", min_value=0.5,
                                                max_value=8.0, step=0.5, value=1.0)
                     motivo_p = st.text_area("Motivo *")
@@ -1432,7 +1554,7 @@ def _page_permisos_con_rol():
 
         with tab1:
             if not emp:
-                st.warning("No se encontró tu perfil de empleado. Avisa a RRHH.")
+                aviso_sin_perfil(sm, emp_id)
             else:
                 nombre_emp = str(emp.get("Nombre", emp_id))
                 jefe = sm.get_email_jefe(emp_id)
@@ -1445,7 +1567,7 @@ def _page_permisos_con_rol():
                                "directamente a RRHH.")
 
                 with st.form("form_permiso", clear_on_submit=True):
-                    fecha_p  = st.date_input("Fecha del permiso", date.today())
+                    fecha_p  = st.date_input("Fecha del permiso", hoy())
                     horas_p  = st.number_input("Horas solicitadas", min_value=0.5,
                                                max_value=8.0, step=0.5, value=1.0)
                     motivo_p = st.text_area("Motivo *")
@@ -1589,7 +1711,7 @@ def _page_vacaciones_con_rol():
 
         with tab1:
             if not emp:
-                st.warning("No se encontró tu perfil de empleado. Avisa a RRHH.")
+                aviso_sin_perfil(sm, emp_id)
             else:
                 nombre_emp = str(emp.get("Nombre", emp_id))
                 jefe = sm.get_email_jefe(emp_id)
@@ -1681,7 +1803,7 @@ def _page_horas_extras_con_rol():
                 else:
                     emp_id = list(opciones.values())[0]
                     st.info(f"👤 Registrando para: **{list(opciones.keys())[0]}**")
-                fecha_hex = st.date_input("Fecha", date.today())
+                fecha_hex = st.date_input("Fecha", hoy())
                 horas_hex = st.number_input("Horas extra", min_value=0.5, max_value=12.0, step=0.5, value=1.0)
                 motivo_hex = st.text_area("Motivo / justificación *")
                 if st.form_submit_button("💾 Registrar", type="primary"):
@@ -1878,7 +2000,7 @@ def page_expediente_empleado():
           <p>ID: {emp_id} &nbsp;|&nbsp; Área: {emp.get('Area','–')} &nbsp;|&nbsp;
              Email: {emp.get('Email','–')} &nbsp;|&nbsp;
              Horario: {emp.get('Horario_Inicio','–')} – {emp.get('Horario_Fin','–')} &nbsp;|&nbsp;
-             Generado: {date.today().strftime('%d/%m/%Y')}</p>
+             Generado: {hoy().strftime('%d/%m/%Y')}</p>
         </div>
         <div class="kpis">
           <div class="kpi"><p class="val">{total_asis}</p><p class="lbl">Asistencias</p></div>
@@ -1895,13 +2017,13 @@ def page_expediente_empleado():
         <h2>📅 Historial de Asistencia</h2>
         <table><tr><th>Fecha</th><th>Entrada</th><th>Salida</th><th>Estado</th><th>Min. atraso</th><th>Observaciones</th></tr>
         {filas_asis}</table>
-        <div class="footer">Quski – Sistema de Asistencia RRHH &nbsp;|&nbsp; Documento generado el {date.today().strftime('%d/%m/%Y')}</div>
+        <div class="footer">Quski – Sistema de Asistencia RRHH &nbsp;|&nbsp; Documento generado el {hoy().strftime('%d/%m/%Y')}</div>
         </body></html>"""
 
         st.download_button(
             label="⬇️ Descargar expediente",
             data=html_exp.encode("utf-8"),
-            file_name=f"expediente_{emp_id}_{emp['Nombre'].replace(' ','_')}_{date.today().strftime('%Y%m%d')}.html",
+            file_name=f"expediente_{emp_id}_{emp['Nombre'].replace(' ','_')}_{hoy().strftime('%Y%m%d')}.html",
             mime="text/html",
             use_container_width=True,
         )
@@ -1914,13 +2036,13 @@ def page_llamados_atencion():
 
     tab1, tab2, tab3 = st.tabs(["📊 Monitor de Atrasos", "➕ Emitir Llamado", "📋 Historial"])
 
-    mes_actual = date.today().strftime("%Y-%m")
+    mes_actual = hoy().strftime("%Y-%m")
     df_emp  = sm.get_empleados()
     df_asis = sm.get_df("Asistencia")
     df_llamados = sm.get_llamados_atencion()
 
     with tab1:
-        st.subheader(f"Tardanzas del mes – {date.today().strftime('%B %Y')}")
+        st.subheader(f"Tardanzas del mes – {hoy().strftime('%B %Y')}")
         umbral = st.number_input("Umbral de alerta (número de tardanzas)", min_value=1, max_value=20, value=3,
                                   help="Empleados con igual o más tardanzas que este número serán marcados en rojo")
 
@@ -2017,7 +2139,7 @@ def page_llamados_atencion():
                                       ("Motivo", motivo),
                                       ("Tardanzas acumuladas en el mes", atrasos_mes),
                                       ("Emitido por", registrado_por),
-                                      ("Fecha", date.today().strftime("%d/%m/%Y"))]
+                                      ("Fecha", hoy().strftime("%d/%m/%Y"))]
 
                         cuerpo_emp = (
                             f"<p>Estimado/a <strong>{esc(nombre_emp)}</strong>,</p>"
@@ -2116,6 +2238,8 @@ def main():
             "Mis Horas Extra":   _page_horas_extras_con_rol,
             "Cambiar Contraseña": page_cambiar_password,
         }
+
+    mostrar_flash()
 
     fn = pages.get(page)
     if fn:

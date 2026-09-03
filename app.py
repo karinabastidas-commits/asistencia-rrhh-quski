@@ -14,6 +14,8 @@ from sheets_manager import (
     es_error_transitorio, leer_formulario_kye,
     EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO, TIPO_TARDANZA,
     CAUSALES_LLAMADO, GRAVEDAD_CAUSAL, TIPOS_RECONOCIMIENTO,
+    CATEGORIAS_DOCUMENTO, TIPOS_DOC_KYE, ESTADOS_CURSO,
+    FINANCIAMIENTO_CURSO, NIVELES_TITULO,
     password_debil,
 )
 
@@ -892,6 +894,7 @@ def sidebar():
                 "🔐  Gestión Usuarios",
                 "🏖️  Saldo Vacaciones",
                 "🛡️  Riesgo Operativo",
+                "🎓  Formación",
                 "⚠️  Llamados de Atención",
                 "📁  Expediente",
             ]
@@ -902,6 +905,7 @@ def sidebar():
                 options.append("✍️  Aprobaciones")
                 options.append("⚠️  Llamados de Atención")
             options += [
+                "🎓  Mi Formación",
                 "📋  Mis Permisos",
                 "🏖️  Mis Vacaciones",
                 "⏰  Mis Horas Extra",
@@ -1396,6 +1400,18 @@ def page_configuracion():
             tard_suspension = st.number_input("Suspensión", min_value=1, max_value=30,
                 value=_cfg_int(config, "Tardanzas_Suspension", 8))
 
+        st.subheader("📂 Repositorio de documentos")
+        st.caption("Los archivos del personal se guardan en una carpeta de Google "
+                   "Drive; en la hoja solo queda el enlace.")
+        drive_id = st.text_input(
+            "ID de la carpeta de Drive",
+            value=config.get("Drive_Carpeta_ID", ""),
+            help="Está en la URL de la carpeta: drive.google.com/drive/folders/ESTE_ID")
+        st.caption("⚠️ La carpeta debe ser de una persona (no de la cuenta de "
+                   "servicio) y estar compartida como **Editor** con el correo "
+                   "de la cuenta de servicio. Las cuentas de servicio no tienen "
+                   "espacio propio en Drive.")
+
         st.subheader("🛡️ Riesgo operativo – pesos del modelo")
         st.caption("Cuánto pesa cada factor en el puntaje de riesgo. Se normalizan a "
                    "100, así que poner uno en cero lo elimina y redistribuye el resto.")
@@ -1417,6 +1433,9 @@ def page_configuracion():
                 _cfg_int(config, "Riesgo_Peso_Disciplina", 25))
             w_ant = st.number_input("Antigüedad", 0, 100,
                 _cfg_int(config, "Riesgo_Peso_Antiguedad", 10))
+            w_for = st.number_input("Formación académica", 0, 100,
+                _cfg_int(config, "Riesgo_Peso_Formacion", 10),
+                help="Títulos validados y cursos recientes reducen el riesgo.")
         b1, b2, b3 = st.columns(3)
         with b1:
             buro_bueno = st.number_input("Score de buró considerado bueno", 0, 1000,
@@ -1466,6 +1485,8 @@ def page_configuracion():
                 "Riesgo_Peso_Familiar":        str(w_fam),
                 "Riesgo_Peso_Disciplina":      str(w_dis),
                 "Riesgo_Peso_Antiguedad":      str(w_ant),
+                "Riesgo_Peso_Formacion":       str(w_for),
+                "Drive_Carpeta_ID":            drive_id.strip(),
                 "Buro_Score_Bueno":            str(buro_bueno),
                 "Buro_Score_Malo":             str(buro_malo),
                 "Riesgo_Umbral_Medio":         str(u_med),
@@ -2864,6 +2885,419 @@ def page_riesgo_operativo():
             st.info("Sin reconocimientos registrados para esta persona.")
 
 
+# ── Módulo: Formación, títulos y documentos ──────────────────────────────────
+def _carpeta_drive(config) -> str:
+    return str(config.get("Drive_Carpeta_ID", "") or "").strip()
+
+
+def _subir_y_registrar(sm, config, emp_id, nombre_emp, archivo, categoria,
+                       tipo_doc, quien, estado, referencia="") -> str | None:
+    """Sube el archivo a Drive y deja el registro en la hoja. Devuelve el ID."""
+    carpeta = _carpeta_drive(config)
+    if not carpeta:
+        st.error("❌ No hay carpeta de Drive configurada. RRHH debe hacerlo en "
+                 "Configuración antes de poder subir documentos.")
+        return None
+    try:
+        with st.spinner("Subiendo el archivo a Drive…"):
+            # Nombre único y descriptivo para poder ubicarlo en la carpeta
+            limpio = "".join(c for c in archivo.name if c.isalnum() or c in "._- ")
+            final = f"{emp_id}_{ahora().strftime('%Y%m%d-%H%M')}_{limpio}"
+            subido = sm.subir_documento_drive(archivo, final, carpeta)
+            did = sm.registrar_documento(
+                emp_id, nombre_emp, categoria, tipo_doc, final,
+                subido["id"], subido["link"], quien, estado, referencia)
+        return did
+    except Exception as e:
+        st.error(f"❌ No se pudo subir el archivo: {e}")
+        st.caption("Si dice *storageQuotaExceeded* o *File not found*, revisa que "
+                   "la carpeta de Drive esté compartida como **Editor** con la "
+                   "cuenta de servicio.")
+        return None
+
+
+def _tabla_documentos(df, mostrar_empleado=False):
+    if df.empty:
+        st.info("Sin documentos registrados.")
+        return
+    cols = ["ID_Documento", "Fecha"] + (["Nombre"] if mostrar_empleado else []) + \
+           ["Categoria", "Tipo_Documento", "Estado", "Revisado_Por", "Observaciones"]
+    vista = df[[c for c in cols if c in df.columns]].copy()
+    if "Estado" in vista.columns:
+        iconos = {"Pendiente": "⏳ Pendiente", "Aprobado": "✅ Aprobado",
+                  "Rechazado": "❌ Rechazado"}
+        vista["Estado"] = vista["Estado"].map(lambda v: iconos.get(str(v).strip(), v))
+    st.dataframe(vista, use_container_width=True, hide_index=True)
+    # Los enlaces se listan aparte: dentro de una tabla no son clicables
+    with st.expander("🔗 Abrir los archivos en Drive"):
+        for _, r in df.iterrows():
+            link = str(r.get("Drive_Link", "")).strip()
+            etiqueta = f"{r.get('ID_Documento','')} · {r.get('Tipo_Documento','')}"
+            if link:
+                st.markdown(f"- [{etiqueta}]({link})")
+            else:
+                st.markdown(f"- {etiqueta} — sin enlace")
+
+
+def page_formacion():
+    sm = get_sm()
+    config = st.session_state.config
+    usuario = get_usuario()
+    admin = es_admin()
+    quien = str(usuario.get("nombre", "")) if usuario else ""
+
+    st.title("🎓 Formación y Documentos" if admin else "🎓 Mi Formación")
+
+    if admin:
+        et_rev = "📥 Por revisar"
+        et_doc = "📂 Documentos"
+        et_cur = "📚 Capacitación"
+        et_tit = "🎓 Títulos"
+        seccion = secciones([et_rev, et_doc, et_cur, et_tit], "sec_formacion_admin")
+    else:
+        et_doc = "📤 Subir documentos"
+        et_cur = "📚 Mis cursos"
+        et_tit = "🎓 Mis títulos"
+        et_rev = None
+        seccion = secciones([et_doc, et_cur, et_tit], "sec_formacion_emp")
+    st.divider()
+
+    if not _carpeta_drive(config):
+        st.warning("⚠️ Todavía no hay carpeta de Google Drive configurada, así que "
+                   "no se pueden subir archivos." +
+                   (" Configúrala en **Configuración → Repositorio de documentos**."
+                    if admin else " Avisa a RRHH."))
+
+    df_emp = sm.get_empleados()
+    if admin:
+        if df_emp.empty:
+            st.warning("No hay empleados registrados.")
+            return
+        opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
+                    for _, r in df_emp.iterrows() if str(r["ID_Empleado"]).strip()}
+    else:
+        emp_id = str(usuario.get("id_empleado", "")).strip()
+        emp = sm.get_empleado(emp_id)
+        if not emp:
+            aviso_sin_perfil(sm, emp_id)
+            return
+        nombre_emp = str(emp.get("Nombre", emp_id))
+
+    # ══ RRHH: cola de revisión ═══════════════════════════════════════════════
+    if admin and seccion == et_rev:
+        pend_doc = sm.get_documentos(estado="Pendiente")
+        titulos  = sm.get_titulos()
+        pend_tit = (titulos[titulos["Estado_Validacion"].astype(str) == "Pendiente"]
+                    if not titulos.empty else pd.DataFrame())
+
+        c1, c2 = st.columns(2)
+        c1.metric("Documentos por revisar", len(pend_doc))
+        c2.metric("Títulos por validar", len(pend_tit))
+
+        st.subheader("Documentos enviados por el personal")
+        if pend_doc.empty:
+            st.success("✅ No hay documentos pendientes de revisión.")
+        else:
+            for _, d in pend_doc.iterrows():
+                did = str(d["ID_Documento"])
+                with st.container(border=True):
+                    st.markdown(f"### {d.get('Nombre','')}")
+                    st.caption(f"{did} · {d.get('Categoria','')} · "
+                               f"{d.get('Tipo_Documento','')} · subido "
+                               f"{d.get('Fecha','')} por {d.get('Subido_Por','')}")
+                    link = str(d.get("Drive_Link", "")).strip()
+                    if link:
+                        st.markdown(f"📎 [Abrir el archivo en Drive]({link})")
+                    else:
+                        st.caption("Sin enlace al archivo.")
+                    obs = st.text_input("Observación (opcional)", key=f"obs_doc_{did}")
+                    b1, b2 = st.columns(2)
+                    with b1:
+                        if st.button("✅ Aprobar", key=f"ok_doc_{did}",
+                                     type="primary", use_container_width=True):
+                            try:
+                                sm.revisar_documento(did, True, quien, obs)
+                                flash("success", f"✅ Documento {did} aprobado.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ {e}")
+                    with b2:
+                        if st.button("❌ Rechazar", key=f"no_doc_{did}",
+                                     use_container_width=True):
+                            if not obs.strip():
+                                st.error("Indica el motivo del rechazo en la observación.")
+                            else:
+                                try:
+                                    sm.revisar_documento(did, False, quien, obs)
+                                    flash("warning", f"Documento {did} rechazado.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ {e}")
+
+        st.divider()
+        st.subheader("Títulos por validar")
+        if pend_tit.empty:
+            st.success("✅ No hay títulos pendientes de validación.")
+        else:
+            for _, t in pend_tit.iterrows():
+                tid = str(t["ID_Titulo"])
+                with st.container(border=True):
+                    st.markdown(f"### {t.get('Nombre','')}")
+                    st.markdown(f"**{t.get('Nivel','')}** — {t.get('Titulo','')}")
+                    st.caption(f"{t.get('Institucion','')} · {t.get('Anio_Obtencion','')} · "
+                               f"SENESCYT: {t.get('Registro_SENESCYT','') or '—'}")
+                    doc_id = str(t.get("Documento_ID", "")).strip()
+                    if doc_id:
+                        docs = sm.get_documentos()
+                        fila = docs[docs["ID_Documento"].astype(str) == doc_id] \
+                               if not docs.empty else pd.DataFrame()
+                        if not fila.empty:
+                            enlace = str(fila.iloc[0].get("Drive_Link", "")).strip()
+                            if enlace:
+                                st.markdown(f"📎 [Ver el título escaneado]({enlace})")
+                    else:
+                        st.warning("Sin documento de respaldo adjunto.")
+                    obs_t = st.text_input("Observación", key=f"obs_tit_{tid}")
+                    v1, v2 = st.columns(2)
+                    with v1:
+                        if st.button("✅ Validar", key=f"ok_tit_{tid}",
+                                     type="primary", use_container_width=True):
+                            try:
+                                sm.validar_titulo(tid, True, quien, obs_t)
+                                flash("success", f"✅ Título {tid} validado.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"❌ {e}")
+                    with v2:
+                        if st.button("⚠️ Observar", key=f"no_tit_{tid}",
+                                     use_container_width=True):
+                            if not obs_t.strip():
+                                st.error("Explica qué se observa del título.")
+                            else:
+                                try:
+                                    sm.validar_titulo(tid, False, quien, obs_t)
+                                    flash("warning", f"Título {tid} observado.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"❌ {e}")
+
+    # ══ Documentos ═══════════════════════════════════════════════════════════
+    elif seccion == et_doc:
+        if admin:
+            sel = st.selectbox("Empleado", list(opciones.keys()), key="doc_emp")
+            emp_id, nombre_emp = opciones[sel], sel.split(" – ")[-1]
+        else:
+            st.info(f"👤 {emp_id} – {nombre_emp}")
+            st.caption("Lo que subas queda **pendiente** hasta que RRHH lo revise.")
+
+        with st.form("form_doc", clear_on_submit=True):
+            categoria = st.selectbox("Categoría", CATEGORIAS_DOCUMENTO)
+            tipo_doc = st.text_input(
+                "Descripción del documento *",
+                placeholder="Ej: Copia de cédula, Certificado de Excel avanzado")
+            archivo = st.file_uploader("Archivo *",
+                                       type=["pdf", "jpg", "jpeg", "png", "docx", "xlsx"],
+                                       help="Máximo 200 MB. Se guarda en la carpeta "
+                                            "de Drive de la empresa.")
+            if st.form_submit_button("📤 Subir documento", type="primary"):
+                if not tipo_doc.strip():
+                    st.error("Describe qué documento es.")
+                elif archivo is None:
+                    st.error("Selecciona un archivo.")
+                else:
+                    estado = "Aprobado" if admin else "Pendiente"
+                    did = _subir_y_registrar(sm, config, emp_id, nombre_emp, archivo,
+                                             categoria, tipo_doc.strip(), quien, estado)
+                    if did:
+                        if admin:
+                            flash("success", f"✅ Documento **{did}** guardado.")
+                        else:
+                            flash("success", f"📤 Documento **{did}** enviado. "
+                                             "Queda pendiente de revisión por RRHH.")
+                            env, _ = notificar(
+                                [config.get("Email_RRHH", "")],
+                                f"Documento por revisar – {nombre_emp}",
+                                f"<p><strong>{esc(nombre_emp)}</strong> subió un "
+                                f"documento para revisión.</p>" +
+                                tabla_html([("Empleado", f"{emp_id} – {nombre_emp}"),
+                                            ("Categoría", categoria),
+                                            ("Documento", tipo_doc.strip()),
+                                            ("Referencia", did)]))
+                        st.rerun()
+
+        st.divider()
+        _tabla_documentos(sm.get_documentos(emp_id))
+
+    # ══ Capacitación ═════════════════════════════════════════════════════════
+    elif seccion == et_cur:
+        if admin:
+            sel = st.selectbox("Empleado", list(opciones.keys()), key="cur_emp")
+            emp_id, nombre_emp = opciones[sel], sel.split(" – ")[-1]
+
+        p = sm.perfil_formacion(emp_id)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Cursos finalizados", p["cursos_finalizados"])
+        c2.metric("En curso", p["cursos_en_curso"])
+        c3.metric("Horas acumuladas", f"{p['horas_capacitacion']:.0f}")
+        if p["formacion_reciente"]:
+            st.success(f"✅ Formación vigente: {p['cursos_recientes']} curso(s) en "
+                       "los últimos dos años.")
+        else:
+            st.warning("⚠️ Sin formación registrada en los últimos dos años.")
+
+        with st.form("form_curso", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                curso = st.text_input("Nombre del curso *")
+                institucion = st.text_input("Institución *")
+                fin_tipo = st.selectbox("Financiamiento", FINANCIAMIENTO_CURSO)
+            with c2:
+                estado_c = st.selectbox("Estado", ESTADOS_CURSO)
+                horas = st.number_input("Horas", min_value=0, max_value=5000, value=0)
+                costo = st.number_input("Costo (USD)", min_value=0.0, step=10.0, value=0.0,
+                                        help="Útil para saber cuánto invirtió la empresa.")
+            f1, f2 = st.columns(2)
+            with f1: f_ini = st.date_input("Fecha de inicio", hoy())
+            with f2: f_fin = st.date_input("Fecha de fin (o prevista)", hoy())
+            cert = st.file_uploader("Certificado (opcional)",
+                                    type=["pdf", "jpg", "jpeg", "png"])
+            obs_c = st.text_area("Observaciones")
+            if st.form_submit_button("💾 Registrar curso", type="primary"):
+                if not curso.strip() or not institucion.strip():
+                    st.error("El nombre del curso y la institución son obligatorios.")
+                else:
+                    doc_id = ""
+                    if cert is not None:
+                        doc_id = _subir_y_registrar(
+                            sm, config, emp_id, nombre_emp, cert,
+                            "Certificado de curso", f"Certificado: {curso.strip()}",
+                            quien, "Aprobado" if admin else "Pendiente") or ""
+                    try:
+                        with st.spinner("Guardando…"):
+                            cid = sm.registrar_capacitacion(
+                                emp_id, nombre_emp, curso.strip(), institucion.strip(),
+                                fin_tipo, f_ini.strftime("%Y-%m-%d"),
+                                f_fin.strftime("%Y-%m-%d"), estado_c, horas, costo,
+                                quien, doc_id, obs_c)
+                        flash("success", f"✅ Curso **{cid}** registrado.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ No se pudo registrar: {e}")
+
+        cursos = sm.get_capacitaciones(emp_id)
+        if not cursos.empty:
+            st.divider()
+            st.subheader("Historial de capacitación")
+            st.dataframe(cursos[[c for c in ("ID_Curso", "Curso", "Institucion",
+                                             "Financiamiento", "Fecha_Inicio",
+                                             "Fecha_Fin", "Estado", "Horas", "Costo")
+                                 if c in cursos.columns]],
+                         use_container_width=True, hide_index=True)
+
+            if admin:
+                st.caption("Actualizar el estado de un curso (por ejemplo, marcarlo "
+                           "como finalizado):")
+                a1, a2, a3 = st.columns([2, 2, 1])
+                with a1:
+                    cid_sel = st.selectbox("Curso", cursos["ID_Curso"].astype(str).tolist(),
+                                           key="cur_upd")
+                with a2:
+                    nuevo = st.selectbox("Nuevo estado", ESTADOS_CURSO, key="cur_estado")
+                with a3:
+                    st.write("")
+                    if st.button("Actualizar", key="btn_cur_upd"):
+                        try:
+                            campos = {"Estado": nuevo}
+                            if nuevo == "Finalizado":
+                                campos["Fecha_Fin"] = hoy().strftime("%Y-%m-%d")
+                            sm.actualizar_capacitacion(cid_sel, campos)
+                            flash("success", f"Curso {cid_sel} → {nuevo}")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ {e}")
+
+            invertido = pd.to_numeric(cursos[cursos["Financiamiento"].astype(str)
+                                      .str.contains("empresa", case=False, na=False)]["Costo"],
+                                      errors="coerce").fillna(0).sum()
+            if invertido:
+                st.info(f"💰 La empresa ha invertido **USD {invertido:,.2f}** en la "
+                        "capacitación de esta persona.")
+
+    # ══ Títulos ══════════════════════════════════════════════════════════════
+    else:
+        if admin:
+            sel = st.selectbox("Empleado", list(opciones.keys()), key="tit_emp")
+            emp_id, nombre_emp = opciones[sel], sel.split(" – ")[-1]
+
+        p = sm.perfil_formacion(emp_id)
+        c1, c2 = st.columns(2)
+        c1.metric("Nivel máximo alcanzado", p["nivel_maximo"])
+        c2.metric("Títulos validados", f"{p['titulos_validados']} de {p['titulos']}")
+
+        with st.form("form_titulo", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                nivel = st.selectbox("Nivel *", list(NIVELES_TITULO.keys()))
+                titulo_n = st.text_input("Título obtenido *",
+                                         placeholder="Ej: Ingeniera en Finanzas")
+            with c2:
+                inst = st.text_input("Institución *")
+                anio = st.number_input("Año de obtención", min_value=1950,
+                                       max_value=hoy().year, value=hoy().year)
+            senescyt = st.text_input("Número de registro SENESCYT",
+                                     help="Permite verificar el título en el registro oficial.")
+            doc_t = st.file_uploader("Copia del título *",
+                                     type=["pdf", "jpg", "jpeg", "png"])
+            obs_t = st.text_area("Observaciones")
+            if st.form_submit_button("🎓 Registrar título", type="primary"):
+                if not titulo_n.strip() or not inst.strip():
+                    st.error("El título y la institución son obligatorios.")
+                elif doc_t is None:
+                    st.error("Adjunta la copia del título para poder validarlo.")
+                else:
+                    doc_id = _subir_y_registrar(
+                        sm, config, emp_id, nombre_emp, doc_t, "Título académico",
+                        f"{nivel}: {titulo_n.strip()}", quien,
+                        "Aprobado" if admin else "Pendiente") or ""
+                    if doc_id:
+                        try:
+                            with st.spinner("Guardando…"):
+                                tid = sm.registrar_titulo(
+                                    emp_id, nombre_emp, nivel, titulo_n.strip(),
+                                    inst.strip(), anio, senescyt.strip(), quien,
+                                    doc_id, obs_t)
+                            flash("success", f"🎓 Título **{tid}** registrado. "
+                                             "Queda pendiente de validación por RRHH.")
+                            if not admin:
+                                notificar([config.get("Email_RRHH", "")],
+                                          f"Título por validar – {nombre_emp}",
+                                          f"<p><strong>{esc(nombre_emp)}</strong> "
+                                          f"registró un título.</p>" +
+                                          tabla_html([("Nivel", nivel),
+                                                      ("Título", titulo_n.strip()),
+                                                      ("Institución", inst.strip()),
+                                                      ("Año", anio),
+                                                      ("SENESCYT", senescyt.strip() or "—")]))
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ No se pudo registrar: {e}")
+
+        titulos = sm.get_titulos(emp_id)
+        if not titulos.empty:
+            st.divider()
+            vista = titulos[[c for c in ("ID_Titulo", "Nivel", "Titulo", "Institucion",
+                                         "Anio_Obtencion", "Registro_SENESCYT",
+                                         "Estado_Validacion", "Validado_Por",
+                                         "Observaciones")
+                             if c in titulos.columns]].copy()
+            iconos = {"Pendiente": "⏳ Pendiente", "Validado": "✅ Validado",
+                      "Observado": "⚠️ Observado"}
+            if "Estado_Validacion" in vista.columns:
+                vista["Estado_Validacion"] = vista["Estado_Validacion"].map(
+                    lambda v: iconos.get(str(v).strip(), v))
+            st.dataframe(vista, use_container_width=True, hide_index=True)
+
+
 # ── Módulo: Expediente del Empleado (solo admin) ─────────────────────────────
 def page_expediente_empleado():
     sm = get_sm()
@@ -3326,6 +3760,7 @@ def main():
             "Gestión Usuarios":     page_gestion_usuarios,
             "Saldo Vacaciones":     page_saldo_vacaciones,
             "Riesgo Operativo":     page_riesgo_operativo,
+            "Formación":            page_formacion,
             "Llamados de Atención": page_llamados_atencion,
             "Expediente":           page_expediente_empleado,
         }
@@ -3334,6 +3769,7 @@ def main():
             "Mi Asistencia":     page_asistencia,
             "Aprobaciones":      page_aprobaciones_jefe,
             "Llamados de Atención": page_llamados_atencion,
+            "Mi Formación":      page_formacion,
             "Mis Permisos":      _page_permisos_con_rol,
             "Mis Vacaciones":    _page_vacaciones_con_rol,
             "Mis Horas Extra":   _page_horas_extras_con_rol,

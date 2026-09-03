@@ -128,7 +128,50 @@ HEADERS = {
                    "Observaciones", "Registrado_Por"],
     "Reconocimientos": ["ID_Reconocimiento", "Fecha", "ID_Empleado", "Nombre", "Tipo",
                         "Motivo", "Otorgado_Por", "Estado"],
+    # Repositorio: el archivo vive en Drive, aquí queda el enlace y su estado
+    "Documentos": ["ID_Documento", "Fecha", "ID_Empleado", "Nombre", "Categoria",
+                   "Tipo_Documento", "Nombre_Archivo", "Drive_ID", "Drive_Link",
+                   "Subido_Por", "Estado", "Revisado_Por", "Fecha_Revision",
+                   "Referencia", "Observaciones"],
+    "Capacitaciones": ["ID_Curso", "ID_Empleado", "Nombre", "Curso", "Institucion",
+                       "Financiamiento", "Fecha_Inicio", "Fecha_Fin", "Estado",
+                       "Horas", "Costo", "Documento_ID", "Registrado_Por",
+                       "Observaciones"],
+    "Titulos": ["ID_Titulo", "ID_Empleado", "Nombre", "Nivel", "Titulo",
+                "Institucion", "Anio_Obtencion", "Registro_SENESCYT",
+                "Documento_ID", "Estado_Validacion", "Validado_Por",
+                "Fecha_Validacion", "Registrado_Por", "Observaciones"],
 }
+
+# Niveles de formación, de menor a mayor. El puntaje se usa para reconocer la
+# formación en la matriz de riesgo: a mayor nivel, menor riesgo operativo.
+NIVELES_TITULO = {
+    "Bachiller": 1,
+    "Técnico / Tecnólogo": 2,
+    "Tercer nivel (grado)": 3,
+    "Especialización": 4,
+    "Cuarto nivel (maestría)": 5,
+    "Doctorado (PhD)": 6,
+}
+
+CATEGORIAS_DOCUMENTO = [
+    "Documento KYE",
+    "Hoja de vida",
+    "Título académico",
+    "Certificado de curso",
+    "Certificado laboral",
+    "Otro",
+]
+
+TIPOS_DOC_KYE = [
+    "a) Hoja de vida", "b) Copia de cédula", "c) Cédula del cónyuge",
+    "d) Papeleta de votación", "e) Papeleta del cónyuge",
+    "f) Referencias laborales", "g) Referencias personales",
+    "h) Planilla de servicio básico", "i) Declaración patrimonial",
+]
+
+ESTADOS_CURSO = ["En curso", "Finalizado", "Abandonado", "Inscrito"]
+FINANCIAMIENTO_CURSO = ["Pagado por la empresa", "Cofinanciado", "Por cuenta del empleado"]
 
 # Tipos de reconocimiento que se registran en el expediente
 TIPOS_RECONOCIMIENTO = [
@@ -180,6 +223,11 @@ CONFIG_DEFAULTS = {
     "Riesgo_Puntos_Disciplina_Tope":  "12",
     "Riesgo_Peso_Reconocimiento":     "1.5",
     "Riesgo_Antiguedad_Anios":        "2",
+    "Riesgo_Peso_Formacion":          "10",
+    # Carpeta de Google Drive donde se guardan los documentos del personal.
+    # Debe ser de una persona real y estar compartida como Editor con la
+    # cuenta de servicio: los service accounts no tienen espacio propio.
+    "Drive_Carpeta_ID":               "",
 }
 
 # ── Estados del flujo de aprobación ───────────────────────────────────────────
@@ -442,6 +490,8 @@ class SheetsManager:
         else:
             creds = Credentials.from_service_account_file(credentials_source, scopes=SCOPES)
 
+        self.credenciales = creds          # necesarias para el servicio de Drive
+        self._drive = None
         self.client = gspread.authorize(creds)
         self.spreadsheet = con_reintentos(self.client.open_by_key, SPREADSHEET_ID)
         # Caché de lecturas y último error de lectura, para no confundir un
@@ -1324,7 +1374,8 @@ class SheetsManager:
 
     def ensure_hojas_riesgo(self):
         """Crea las hojas de KYE, buró y reconocimientos si no existen."""
-        for hoja in ("KYE_Empleado", "Score_Buro", "Reconocimientos"):
+        for hoja in ("KYE_Empleado", "Score_Buro", "Reconocimientos",
+                     "Documentos", "Capacitaciones", "Titulos"):
             try:
                 self._sheet(hoja)
                 self.ensure_columns(hoja)
@@ -1561,6 +1612,31 @@ class SheetsManager:
                 "Sin llamados formales en los últimos 12 meses"
         return min(1.0, puntos / max(1.0, tope)), texto
 
+    def _f_formacion(self, id_empleado: str, config: dict) -> tuple:
+        """Formación académica y continuidad educativa.
+
+        Más nivel y capacitación reciente = menor riesgo operativo: alguien
+        formado y actualizado comete menos errores de tasación y de proceso.
+        """
+        p = self.perfil_formacion(id_empleado)
+        if p["puntos_nivel"] == 0 and p["cursos_finalizados"] == 0:
+            return 1.0, "Sin títulos ni cursos registrados"
+        # Nivel académico: 6 puntos (doctorado) reduce el riesgo a cero
+        f_nivel = max(0.0, 1 - p["puntos_nivel"] / 6)
+        # Formación reciente compensa medio punto
+        if p["formacion_reciente"]:
+            f_nivel = max(0.0, f_nivel - 0.25)
+        partes = [f"nivel: {p['nivel_maximo']}"]
+        if p["cursos_finalizados"]:
+            partes.append(f"{p['cursos_finalizados']} curso(s) finalizado(s)")
+        if p["cursos_en_curso"]:
+            partes.append(f"{p['cursos_en_curso']} en curso")
+        if p["formacion_reciente"]:
+            partes.append("con formación en los últimos 2 años")
+        else:
+            partes.append("sin formación reciente")
+        return f_nivel, ", ".join(partes).capitalize()
+
     def _f_antiguedad(self, empleado: dict, config: dict) -> tuple:
         ingreso = self._a_fecha(empleado.get("Fecha_Ingreso"))
         if not ingreso:
@@ -1588,6 +1664,7 @@ class SheetsManager:
             "Situación familiar":   self._a_numero(config.get("Riesgo_Peso_Familiar"), 10),
             "Historial disciplinario": self._a_numero(config.get("Riesgo_Peso_Disciplina"), 25),
             "Antigüedad":           self._a_numero(config.get("Riesgo_Peso_Antiguedad"), 10),
+            "Formación":            self._a_numero(config.get("Riesgo_Peso_Formacion"), 10),
         }
         f_buro, t_buro = self._f_buro(id_empleado, config)
         f_pep,  t_pep  = self._f_pep(kye)
@@ -1595,6 +1672,7 @@ class SheetsManager:
         f_fam,  t_fam  = self._f_familiar(kye, config)
         f_dis,  t_dis  = self._f_disciplina(id_empleado, config)
         f_ant,  t_ant  = self._f_antiguedad(empleado, config)
+        f_for,  t_for  = self._f_formacion(id_empleado, config)
 
         valores = {
             "Score de buró":           (f_buro, t_buro),
@@ -1603,6 +1681,7 @@ class SheetsManager:
             "Situación familiar":      (f_fam,  t_fam),
             "Historial disciplinario": (f_dis,  t_dis),
             "Antigüedad":              (f_ant,  t_ant),
+            "Formación":               (f_for,  t_for),
         }
         total_peso = sum(pesos.values()) or 1.0
         desglose, puntaje = [], 0.0
@@ -1654,6 +1733,205 @@ class SheetsManager:
             })
         out = pd.DataFrame(filas)
         return out.sort_values("Puntaje", ascending=False) if not out.empty else out
+
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Repositorio de documentos en Google Drive
+    # ══════════════════════════════════════════════════════════════════════
+    # Streamlit Cloud no guarda archivos: lo que se sube se pierde al
+    # reiniciar. Por eso los documentos van a una carpeta de Drive y en la
+    # hoja solo se guarda el enlace.
+    #
+    # IMPORTANTE: una cuenta de servicio no tiene almacenamiento propio en
+    # Drive. La carpeta debe ser de una persona real y estar compartida con
+    # la cuenta de servicio como Editor; así el espacio se descuenta de esa
+    # persona y la subida funciona.
+
+    def _servicio_drive(self):
+        from googleapiclient.discovery import build
+        if getattr(self, "_drive", None) is None:
+            self._drive = build("drive", "v3", credentials=self.credenciales,
+                                cache_discovery=False)
+        return self._drive
+
+    def subir_documento_drive(self, archivo, nombre_archivo: str,
+                              carpeta_id: str) -> dict:
+        """Sube un archivo a la carpeta de Drive y devuelve su id y enlace."""
+        from googleapiclient.http import MediaIoBaseUpload
+        import io, mimetypes
+
+        if not carpeta_id or not str(carpeta_id).strip():
+            raise ValueError(
+                "No hay carpeta de Drive configurada. Ve a Configuración y pega "
+                "el ID de la carpeta donde se guardarán los documentos.")
+
+        contenido = archivo.read() if hasattr(archivo, "read") else archivo
+        if not contenido:
+            raise ValueError("El archivo está vacío.")
+
+        tipo = mimetypes.guess_type(nombre_archivo)[0] or "application/octet-stream"
+        medio = MediaIoBaseUpload(io.BytesIO(contenido), mimetype=tipo, resumable=False)
+        meta = {"name": nombre_archivo, "parents": [str(carpeta_id).strip()]}
+        creado = con_reintentos(
+            lambda: self._servicio_drive().files().create(
+                body=meta, media_body=medio,
+                fields="id, webViewLink, size").execute())
+        return {"id": creado.get("id", ""),
+                "link": creado.get("webViewLink", ""),
+                "bytes": int(creado.get("size", 0) or 0)}
+
+    def verificar_carpeta_drive(self, carpeta_id: str) -> dict:
+        """Comprueba que la carpeta existe y que se puede escribir en ella."""
+        if not carpeta_id or not str(carpeta_id).strip():
+            return {"ok": False, "mensaje": "No hay carpeta configurada."}
+        try:
+            info = con_reintentos(
+                lambda: self._servicio_drive().files().get(
+                    fileId=str(carpeta_id).strip(),
+                    fields="id, name, mimeType, capabilities/canAddChildren").execute())
+            if info.get("mimeType") != "application/vnd.google-apps.folder":
+                return {"ok": False, "mensaje": "Ese ID no corresponde a una carpeta."}
+            if not info.get("capabilities", {}).get("canAddChildren"):
+                return {"ok": False, "nombre": info.get("name", ""),
+                        "mensaje": "La carpeta existe pero la cuenta de servicio no "
+                                   "puede escribir en ella. Compártela como Editor."}
+            return {"ok": True, "nombre": info.get("name", ""),
+                    "mensaje": "Carpeta accesible y con permiso de escritura."}
+        except Exception as e:
+            return {"ok": False, "mensaje": f"{type(e).__name__}: {e}"}
+
+    def registrar_documento(self, id_empleado: str, nombre: str, categoria: str,
+                            tipo_doc: str, nombre_archivo: str, drive_id: str,
+                            drive_link: str, subido_por: str, estado: str = "Pendiente",
+                            referencia: str = "", observaciones: str = "") -> str:
+        did = self._next_id("Documentos", "ID_Documento", "DOC")
+        self.append("Documentos", [
+            did, hoy_local().strftime("%Y-%m-%d"), id_empleado, nombre, categoria,
+            tipo_doc, nombre_archivo, drive_id, drive_link, subido_por,
+            estado, "", "", referencia, observaciones])
+        return did
+
+    def get_documentos(self, id_empleado: str = None, categoria: str = None,
+                       estado: str = None) -> pd.DataFrame:
+        df = self.get_df("Documentos")
+        if df.empty:
+            return df
+        if id_empleado:
+            df = df[df["ID_Empleado"].astype(str).str.strip() == str(id_empleado).strip()]
+        if categoria:
+            df = df[df["Categoria"].astype(str) == categoria]
+        if estado:
+            df = df[df["Estado"].astype(str) == estado]
+        return df
+
+    def revisar_documento(self, id_documento: str, aprobado: bool,
+                          revisado_por: str, observaciones: str = ""):
+        fila = self._fila_de("Documentos", "ID_Documento", id_documento)
+        self.update_campos("Documentos", fila, {
+            "Estado": "Aprobado" if aprobado else "Rechazado",
+            "Revisado_Por": revisado_por,
+            "Fecha_Revision": ahora_local().strftime("%Y-%m-%d %H:%M"),
+            "Observaciones": observaciones,
+        })
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Capacitación y títulos
+    # ══════════════════════════════════════════════════════════════════════
+
+    def registrar_capacitacion(self, id_empleado: str, nombre: str, curso: str,
+                               institucion: str, financiamiento: str,
+                               fecha_inicio: str, fecha_fin: str, estado: str,
+                               horas, costo, registrado_por: str,
+                               doc_id: str = "", observaciones: str = "") -> str:
+        cid = self._next_id("Capacitaciones", "ID_Curso", "CAP")
+        self.append("Capacitaciones", [
+            cid, id_empleado, nombre, curso, institucion, financiamiento,
+            fecha_inicio, fecha_fin, estado, horas, costo, doc_id,
+            registrado_por, observaciones])
+        return cid
+
+    def actualizar_capacitacion(self, id_curso: str, campos: dict):
+        fila = self._fila_de("Capacitaciones", "ID_Curso", id_curso)
+        self.update_campos("Capacitaciones", fila, campos)
+
+    def get_capacitaciones(self, id_empleado: str = None) -> pd.DataFrame:
+        df = self.get_df("Capacitaciones")
+        if df.empty or not id_empleado:
+            return df
+        return df[df["ID_Empleado"].astype(str).str.strip() == str(id_empleado).strip()]
+
+    def registrar_titulo(self, id_empleado: str, nombre: str, nivel: str,
+                         titulo: str, institucion: str, anio, senescyt: str,
+                         registrado_por: str, doc_id: str = "",
+                         observaciones: str = "") -> str:
+        tid = self._next_id("Titulos", "ID_Titulo", "TIT")
+        self.append("Titulos", [
+            tid, id_empleado, nombre, nivel, titulo, institucion, anio, senescyt,
+            doc_id, "Pendiente", "", "", registrado_por, observaciones])
+        return tid
+
+    def validar_titulo(self, id_titulo: str, valido: bool, validado_por: str,
+                       observaciones: str = ""):
+        fila = self._fila_de("Titulos", "ID_Titulo", id_titulo)
+        self.update_campos("Titulos", fila, {
+            "Estado_Validacion": "Validado" if valido else "Observado",
+            "Validado_Por": validado_por,
+            "Fecha_Validacion": ahora_local().strftime("%Y-%m-%d %H:%M"),
+            "Observaciones": observaciones,
+        })
+
+    def get_titulos(self, id_empleado: str = None) -> pd.DataFrame:
+        df = self.get_df("Titulos")
+        if df.empty or not id_empleado:
+            return df
+        return df[df["ID_Empleado"].astype(str).str.strip() == str(id_empleado).strip()]
+
+    def perfil_formacion(self, id_empleado: str) -> dict:
+        """Resumen de la formación del asesor: nivel alcanzado, cursos y vigencia.
+
+        La 'continuidad educativa' mira si hay formación en los últimos dos
+        años, que es lo que interesa para sustentar que el personal se mantiene
+        actualizado.
+        """
+        titulos = self.get_titulos(id_empleado)
+        cursos  = self.get_capacitaciones(id_empleado)
+
+        nivel_max, puntos_nivel = "Sin registro", 0
+        if not titulos.empty:
+            validos = titulos[titulos["Estado_Validacion"].astype(str) != "Observado"]
+            for _, t in validos.iterrows():
+                n = str(t.get("Nivel", "")).strip()
+                p = NIVELES_TITULO.get(n, 0)
+                if p > puntos_nivel:
+                    puntos_nivel, nivel_max = p, n
+
+        corte = hoy_local() - timedelta(days=730)
+        recientes = finalizados = en_curso = 0
+        horas_total = 0.0
+        if not cursos.empty:
+            for _, c in cursos.iterrows():
+                estado = str(c.get("Estado", "")).strip()
+                if estado == "Finalizado":
+                    finalizados += 1
+                    horas_total += self._a_numero(c.get("Horas"), 0)
+                elif estado == "En curso":
+                    en_curso += 1
+                f = self._a_fecha(c.get("Fecha_Fin")) or self._a_fecha(c.get("Fecha_Inicio"))
+                if f and f >= corte:
+                    recientes += 1
+
+        return {
+            "nivel_maximo": nivel_max,
+            "puntos_nivel": puntos_nivel,
+            "titulos": 0 if titulos.empty else len(titulos),
+            "titulos_validados": 0 if titulos.empty else int(
+                (titulos["Estado_Validacion"].astype(str) == "Validado").sum()),
+            "cursos_finalizados": finalizados,
+            "cursos_en_curso": en_curso,
+            "horas_capacitacion": horas_total,
+            "formacion_reciente": recientes > 0,
+            "cursos_recientes": recientes,
+        }
 
     # ── Llamados de Atención ─────────────────────────────────────────────────
 

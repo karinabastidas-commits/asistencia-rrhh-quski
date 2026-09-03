@@ -331,6 +331,40 @@ def mostrar_flash():
         getattr(st, tipo, st.info)(mensaje)
 
 
+def sin_datos(mensaje: str, tipo: str = "info"):
+    """Dice que no hay datos SOLO si de verdad no los hay.
+
+    Si la última lectura de Google falló, lo que corresponde no es "no hay
+    empleados registrados" —que hace pensar que se borró todo— sino decir que
+    no se pudo leer. La diferencia importa: una es una hoja vacía y la otra es
+    una caída de Google o un encabezado dañado.
+    """
+    sm = get_sm()
+    detalle = getattr(sm, "ultimo_error", None) if sm else None
+    if not detalle:
+        getattr(st, tipo, st.info)(mensaje)
+        return False
+    st.error("❌ No se pudieron leer los datos de Google Sheets. **No es que "
+             "estén vacíos: es que no se pudieron leer.**")
+    bajo = detalle.lower()
+    if "429" in detalle or "quota" in bajo or "rate_limit" in bajo:
+        st.info("Se superó el límite de consultas por minuto de Google Sheets. "
+                "Espera un minuto y vuelve a cargar la página.")
+    elif "503" in detalle or "500" in detalle or "unavailable" in bajo:
+        st.info("Google tuvo una caída pasajera. Vuelve a cargar la página en "
+                "un momento; los datos están intactos.")
+    elif "header" in bajo or "unique" in bajo or "duplicate" in bajo:
+        st.info("La primera fila de la hoja tiene encabezados repetidos o en "
+                "blanco. Revísala en Configuración → Diagnóstico de hojas.")
+    elif "permission" in bajo or "403" in detalle:
+        st.info("La cuenta de servicio perdió el permiso sobre el archivo. "
+                "Vuelve a compartir el Google Sheet como Editor con "
+                "rrhh-196@rrhh-507215.iam.gserviceaccount.com.")
+    with st.expander("🔍 Detalle técnico"):
+        st.code(detalle, language=None)
+    return True
+
+
 def aviso_sin_perfil(sm, emp_id):
     """Explica por qué no se encontró el perfil, sin confundir un fallo de
     lectura de Google Sheets con una ficha inexistente."""
@@ -1071,7 +1105,7 @@ def page_empleados():
 
     with tab1:
         if df.empty:
-            st.info("No hay empleados registrados.")
+            sin_datos("No hay empleados registrados.", "info")
         else:
             col_f1, col_f2 = st.columns(2)
             with col_f1:
@@ -1132,7 +1166,7 @@ def page_empleados():
 
     with tab3:
         if df.empty:
-            st.info("No hay empleados para editar.")
+            sin_datos("No hay empleados para editar.", "info")
         else:
             opciones = {f"{row['ID_Empleado']} – {row['Nombre']}": row["ID_Empleado"]
                         for _, row in df.iterrows()}
@@ -1214,7 +1248,7 @@ def page_asistencia():
         st.subheader(f"Registrar entrada – {hoy().strftime('%d/%m/%Y')}")
         opciones = emp_opciones(df_emp_fil)
         if not opciones:
-            st.warning("No hay empleados registrados.")
+            sin_datos("No hay empleados registrados.", "warning")
         else:
             if admin:
                 sel = st.selectbox("Empleado", list(opciones.keys()), key="entrada_emp")
@@ -1255,7 +1289,7 @@ def page_asistencia():
         st.subheader(f"Registrar salida – {hoy().strftime('%d/%m/%Y')}")
         opciones = emp_opciones(df_emp_fil)
         if not opciones:
-            st.warning("No hay empleados registrados.")
+            sin_datos("No hay empleados registrados.", "warning")
         else:
             if admin:
                 sel = st.selectbox("Empleado", list(opciones.keys()), key="salida_emp")
@@ -1345,14 +1379,14 @@ def page_asistencia():
                 with rc2: st.metric("Tardanzas", len(df_filtro[df_filtro["Estado"] == "Tardanza"]))
                 with rc3: st.metric("Ausencias",  len(df_filtro[df_filtro["Estado"] == "Ausente"]))
         else:
-            st.info("No hay registros de asistencia.")
+            sin_datos("No hay registros de asistencia.", "info")
 
     if tab4:
         with tab4:
             st.subheader("Marcar ausencia")
             opciones = emp_opciones(df_emp)
             if not opciones:
-                st.warning("No hay empleados registrados.")
+                sin_datos("No hay empleados registrados.", "warning")
             else:
                 sel = st.selectbox("Empleado", list(opciones.keys()), key="aus_emp")
                 emp_id, nombre = opciones[sel]
@@ -1584,6 +1618,40 @@ def page_configuracion():
 
     # ── Diagnóstico de email ──────────────────────────────────────────────────
     st.divider()
+    st.subheader("🩺 Diagnóstico de hojas")
+    st.caption("Cuántas filas tiene cada pestaña del Google Sheet y si se puede "
+               "leer. Sirve para distinguir una hoja vacía de una hoja que no "
+               "se está leyendo — en pantalla se ven igual, pero no son lo mismo.")
+
+    if st.button("🔍 Revisar todas las hojas", key="btn_diag_hojas"):
+        with st.spinner("Revisando cada pestaña…"):
+            try:
+                filas = sm.diagnostico_hojas()
+            except Exception as e:
+                filas = None
+                st.error(f"No se pudo revisar: {type(e).__name__}: {e}")
+        if filas:
+            st.session_state["diag_hojas"] = filas
+
+    filas = st.session_state.get("diag_hojas")
+    if filas:
+        problemas = [f for f in filas if not f["Estado"].startswith("✅")]
+        vacias    = [f for f in filas if f["Estado"].startswith("✅") and f["Filas"] == 0]
+        if problemas:
+            st.error(f"❌ {len(problemas)} hoja(s) con problemas. Son las que en "
+                     "pantalla se verían como si no tuvieran datos.")
+        else:
+            st.success("✅ Todas las hojas se leen correctamente.")
+        if vacias:
+            st.info("Sin filas todavía (esto sí es estar vacía): "
+                    + ", ".join(f["Hoja"] for f in vacias))
+        st.dataframe(tabla_segura(pd.DataFrame(filas)), use_container_width=True,
+                     hide_index=True)
+        st.caption("«Encabezado repetido» o «en blanco» en la primera fila de la "
+                   "hoja impide leerla entera. Se corrige borrando esa columna "
+                   "sobrante directamente en el Google Sheet.")
+
+    st.divider()
     st.subheader("🧪 Diagnóstico de Email")
     st.caption("Envía un correo de prueba para verificar que la configuración SMTP funciona correctamente.")
 
@@ -1690,7 +1758,7 @@ def page_gestion_usuarios():
 
     with tab2:
         if df_usr.empty:
-            st.info("No hay usuarios creados aún.")
+            sin_datos("No hay usuarios creados aún.", "info")
         else:
             # Mostrar sin el hash de contraseña
             df_show = df_usr[["ID_Empleado", "Rol"]].copy() if "Password_Hash" in df_usr.columns else df_usr
@@ -1993,14 +2061,14 @@ def page_saldo_vacaciones():
 
     df_emp = sm.get_empleados()
     if df_emp.empty:
-        st.warning("No hay empleados registrados.")
+        sin_datos("No hay empleados registrados.", "warning")
         return
 
     if seccion == et_tabla:
         with st.spinner("Calculando saldos…"):
             tabla = sm.tabla_saldos(config)
         if tabla.empty:
-            st.info("No hay empleados para calcular.")
+            sin_datos("No hay empleados para calcular.", "info")
             return
 
         sin_fecha = tabla[tabla["Fecha_Ingreso"] == "—"]
@@ -2035,7 +2103,7 @@ def page_saldo_vacaciones():
         opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
                     for _, r in df_emp.iterrows() if str(r["ID_Empleado"]).strip()}
         if not opciones:
-            st.warning("No hay empleados registrados.")
+            sin_datos("No hay empleados registrados.", "warning")
             return
         sel = st.selectbox("Empleado", list(opciones.keys()), key="saldo_emp_sel")
         emp_id = opciones[sel]
@@ -2096,7 +2164,7 @@ def page_aprobaciones_jefe():
                 st.code(sm.ultimo_error, language=None)
             return
 
-        st.info("No hay empleados asignados a tu cargo.")
+        sin_datos("No hay empleados asignados a tu cargo.", "info")
         with st.expander("🔍 ¿Por qué? Revisar la asignación de jefes", expanded=True):
             if not correo:
                 st.warning("Tu ficha de empleado no tiene correo en la columna "
@@ -2207,7 +2275,7 @@ def _page_permisos_con_rol():
 
         elif seccion == et_hist:
             if df_p.empty:
-                st.info("No hay solicitudes de permisos.")
+                sin_datos("No hay solicitudes de permisos.", "info")
             else:
                 opciones_est = ["Todos", EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO]
                 filtro_est = st.selectbox("Filtrar por estado", opciones_est,
@@ -2225,7 +2293,7 @@ def _page_permisos_con_rol():
             opciones_a = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
                           for _, r in df_emp.iterrows()} if not df_emp.empty else {}
             if not opciones_a:
-                st.warning("No hay empleados registrados.")
+                sin_datos("No hay empleados registrados.", "warning")
             else:
                 with st.form("form_permiso_admin", clear_on_submit=True):
                     sel = st.selectbox("Empleado", list(opciones_a.keys()))
@@ -2368,7 +2436,7 @@ def _page_vacaciones_con_rol():
 
         elif seccion == et_hist:
             if df_v.empty:
-                st.info("No hay solicitudes de vacaciones.")
+                sin_datos("No hay solicitudes de vacaciones.", "info")
             else:
                 opciones_est = ["Todos", EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO]
                 filtro_v = st.selectbox("Filtrar por estado", opciones_est,
@@ -2385,7 +2453,7 @@ def _page_vacaciones_con_rol():
             opciones_a = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
                           for _, r in df_emp.iterrows()} if not df_emp.empty else {}
             if not opciones_a:
-                st.warning("No hay empleados registrados.")
+                sin_datos("No hay empleados registrados.", "warning")
             else:
                 with st.form("form_vac_admin", clear_on_submit=True):
                     sel = st.selectbox("Empleado", list(opciones_a.keys()))
@@ -2524,7 +2592,7 @@ def _page_horas_extras_con_rol():
 
     with tab1:
         if not opciones:
-            st.warning("No hay empleados registrados.")
+            sin_datos("No hay empleados registrados.", "warning")
         else:
             with st.form("form_hex", clear_on_submit=True):
                 if admin:
@@ -2549,7 +2617,7 @@ def _page_horas_extras_con_rol():
         if not admin and usuario and not df_he.empty:
             df_he = df_he[df_he["ID_Empleado"].astype(str) == usuario["id_empleado"]]
         if df_he.empty:
-            st.info("No hay registros de horas extra.")
+            sin_datos("No hay registros de horas extra.", "info")
         else:
             filtro_he = st.selectbox("Filtrar", ["Todos", "Pendiente", "Aprobado"])
             df_hef = df_he if filtro_he == "Todos" else df_he[df_he["Estado"].astype(str) == filtro_he]
@@ -2716,7 +2784,7 @@ def page_riesgo_operativo():
 
     df_emp = sm.get_empleados()
     if df_emp.empty:
-        st.warning("No hay empleados registrados.")
+        sin_datos("No hay empleados registrados.", "warning")
         return
     opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
                 for _, r in df_emp.iterrows() if str(r["ID_Empleado"]).strip()}
@@ -3189,7 +3257,7 @@ def page_formacion():
     df_emp = sm.get_empleados()
     if admin:
         if df_emp.empty:
-            st.warning("No hay empleados registrados.")
+            sin_datos("No hay empleados registrados.", "warning")
             return
         opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
                     for _, r in df_emp.iterrows() if str(r["ID_Empleado"]).strip()}
@@ -3523,7 +3591,7 @@ def page_expediente_empleado():
 
     df_emp = sm.get_empleados()
     if df_emp.empty:
-        st.warning("No hay empleados registrados.")
+        sin_datos("No hay empleados registrados.", "warning")
         return
 
     opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
@@ -3721,7 +3789,7 @@ def page_llamados_atencion():
     mes_actual = hoy().strftime("%Y-%m")
     df_emp  = sm.get_empleados() if admin else sm.get_subordinados(email_usuario_actual())
     if df_emp.empty and not admin:
-        st.info("No hay empleados asignados a tu cargo.")
+        sin_datos("No hay empleados asignados a tu cargo.", "info")
         return
     df_asis = sm.get_df("Asistencia")
     df_llamados = sm.get_llamados_atencion()
@@ -3768,7 +3836,7 @@ def page_llamados_atencion():
         st.info(f"Política: **Verbal** ≥{t_verbal} tard. · **Escrito** ≥{t_escrito} tard. · **Suspensión** ≥{t_suspension} tard.")
 
         if df_emp.empty:
-            st.warning("No hay empleados registrados.")
+            sin_datos("No hay empleados registrados.", "warning")
         else:
             opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
                         for _, r in df_emp.iterrows()}
@@ -3895,7 +3963,7 @@ def page_llamados_atencion():
                        "sirven de respaldo cuando haya que emitir un llamado formal.")
 
         if base.empty:
-            st.info("No hay registros en esta sección.")
+            sin_datos("No hay registros en esta sección.", "info")
         else:
             c1, c2 = st.columns(2)
             with c1:

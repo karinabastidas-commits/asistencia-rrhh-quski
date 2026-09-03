@@ -525,6 +525,42 @@ class SheetsManager:
         else:
             self._cache.clear()
 
+    def _leer_crudo(self, sheet_name: str) -> list:
+        """Lee la hoja celda por celda cuando el encabezado no es utilizable.
+
+        Resuelve los dos casos que rompen a gspread: encabezados repetidos
+        —al segundo se le añade un sufijo— y celdas de encabezado vacías, que
+        se descartan junto con su columna. Así una hoja con una columna de
+        sobra sigue leyéndose completa en vez de no leerse nada.
+        """
+        valores = con_reintentos(self._sheet(sheet_name).get_all_values)
+        if not valores:
+            return []
+        cabecera = [str(c).strip() for c in valores[0]]
+        usados, columnas = {}, []
+        for i, nombre in enumerate(cabecera):
+            if not nombre:
+                columnas.append(None)          # columna sin nombre: se ignora
+                continue
+            if nombre in usados:
+                usados[nombre] += 1
+                nombre = f"{nombre}_{usados[nombre]}"
+            else:
+                usados[nombre] = 0
+            columnas.append(nombre)
+        registros = []
+        for fila in valores[1:]:
+            if not any(str(c).strip() for c in fila):
+                continue                        # fila totalmente vacía
+            reg = {}
+            for i, nombre in enumerate(columnas):
+                if nombre is None:
+                    continue
+                reg[nombre] = fila[i] if i < len(fila) else ""
+            if reg:
+                registros.append(reg)
+        return registros
+
     def get_df(self, sheet_name: str, usar_cache: bool = True) -> pd.DataFrame:
         """Lee la hoja y devuelve DataFrame. Normaliza nombres de columnas.
 
@@ -541,10 +577,23 @@ class SheetsManager:
             records = con_reintentos(self._sheet(sheet_name).get_all_records)
             self.ultimo_error = None
         except Exception as e:
-            # Se guarda el error en vez de silenciarlo: antes, una cuota
-            # agotada de la API se veía en pantalla como "no hay datos".
-            self.ultimo_error = f"{type(e).__name__}: {e}"
-            return pd.DataFrame(columns=HEADERS[sheet_name])
+            # get_all_records exige que la fila 1 tenga nombres únicos y no
+            # vacíos. Una hoja que se ha editado a mano casi siempre termina
+            # con una columna repetida o una celda en blanco al final, y
+            # entonces revienta la lectura ENTERA: la pantalla se ve como si
+            # no hubiera datos, cuando los datos están ahí.
+            # Segundo intento leyendo las celdas en crudo y armando la tabla
+            # nosotros mismos, que es lo que debió hacerse desde el principio.
+            try:
+                records = self._leer_crudo(sheet_name)
+                self.ultimo_error = None
+            except Exception as e2:
+                # Se guarda el error en vez de silenciarlo: antes, una cuota
+                # agotada de la API se veía en pantalla como "no hay datos".
+                self.ultimo_error = f"{type(e).__name__}: {e}"
+                if type(e2) is not type(e) or str(e2) != str(e):
+                    self.ultimo_error += f" | segundo intento: {type(e2).__name__}: {e2}"
+                return pd.DataFrame(columns=HEADERS[sheet_name])
 
         if records:
             df = pd.DataFrame(records)
@@ -1402,6 +1451,52 @@ class SheetsManager:
                               values=[cols], value_input_option="USER_ENTERED")
                 except Exception:
                     pass
+
+    def diagnostico_hojas(self) -> list:
+        """Estado de cada hoja: cuántas filas tiene y si se pudo leer.
+
+        Sirve para distinguir de un vistazo entre 'la hoja está vacía' y 'la
+        hoja no se pudo leer', que en pantalla se veían igual.
+        """
+        salida = []
+        for nombre in HEADERS:
+            fila = {"Hoja": nombre, "Filas": 0, "Estado": "", "Detalle": ""}
+            try:
+                ws = self._sheet(nombre)
+            except Exception as e:
+                fila["Estado"] = "❌ No existe la pestaña"
+                fila["Detalle"] = f"{type(e).__name__}: {e}"
+                salida.append(fila)
+                continue
+            try:
+                valores = con_reintentos(ws.get_all_values)
+            except Exception as e:
+                fila["Estado"] = "❌ No se pudo leer"
+                fila["Detalle"] = f"{type(e).__name__}: {e}"
+                salida.append(fila)
+                continue
+            cabecera = [str(c).strip() for c in (valores[0] if valores else [])]
+            datos = [f for f in valores[1:] if any(str(c).strip() for c in f)]
+            fila["Filas"] = len(datos)
+            problemas = []
+            vistos = set()
+            for c in cabecera:
+                if c and c in vistos:
+                    problemas.append(f"encabezado repetido: {c}")
+                vistos.add(c)
+            vacias = sum(1 for i, c in enumerate(cabecera) if not c)
+            if vacias:
+                problemas.append(f"{vacias} encabezado(s) en blanco")
+            faltan = [c for c in HEADERS[nombre] if c not in cabecera]
+            if faltan:
+                problemas.append("faltan columnas: " + ", ".join(faltan))
+            if problemas:
+                fila["Estado"] = "⚠️ Se lee, con avisos"
+                fila["Detalle"] = " · ".join(problemas)
+            else:
+                fila["Estado"] = "✅ Correcta"
+            salida.append(fila)
+        return salida
 
     def get_kye(self, id_empleado: str) -> dict:
         """Ficha KYE del empleado, o dict vacío si aún no se ha llenado."""

@@ -22,6 +22,43 @@ _CACHE_TTL = 15
 
 ZONA_POR_DEFECTO = "America/Guayaquil"
 
+# ── Reintentos ante fallos transitorios de Google ─────────────────────────────
+# La API de Sheets devuelve 503 ("service currently unavailable") o 500 de vez
+# en cuando, sin que haya nada mal en la petición: son caídas momentáneas del
+# lado de Google. Sin reintentos, un 503 de un segundo deja a todo el personal
+# sin poder entrar al sistema.
+REINTENTOS_MAX = 4
+ESPERA_BASE_SEG = 1.5
+
+_ERRORES_TRANSITORIOS = ("503", "500", "502", "504", "429",
+                         "currently unavailable", "internal error",
+                         "backend error", "quota exceeded", "rate_limit")
+
+
+def es_error_transitorio(e) -> bool:
+    texto = f"{type(e).__name__}: {e}".lower()
+    return any(marca in texto for marca in _ERRORES_TRANSITORIOS)
+
+
+def con_reintentos(fn, *args, **kwargs):
+    """Ejecuta una llamada a la API reintentando ante fallos pasajeros.
+
+    Espera cada vez más entre intentos (1.5s, 3s, 6s) para no empeorar una
+    sobrecarga. Los errores que no son transitorios —permisos, hoja inexistente,
+    petición mal formada— se propagan de inmediato: reintentarlos no sirve.
+    """
+    ultimo = None
+    for intento in range(REINTENTOS_MAX):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if not es_error_transitorio(e) or intento == REINTENTOS_MAX - 1:
+                raise
+            ultimo = e
+            time.sleep(ESPERA_BASE_SEG * (2 ** intento))
+    if ultimo:
+        raise ultimo
+
 
 def zona_horaria(config: dict | None = None) -> ZoneInfo:
     """Zona horaria configurada (America/Guayaquil por defecto)."""
@@ -263,7 +300,7 @@ class SheetsManager:
             creds = Credentials.from_service_account_file(credentials_source, scopes=SCOPES)
 
         self.client = gspread.authorize(creds)
-        self.spreadsheet = self.client.open_by_key(SPREADSHEET_ID)
+        self.spreadsheet = con_reintentos(self.client.open_by_key, SPREADSHEET_ID)
         # Caché de lecturas y último error de lectura, para no confundir un
         # fallo de la API con "no hay datos".
         self._cache = {}
@@ -294,7 +331,7 @@ class SheetsManager:
                 return guardado[1].copy()
 
         try:
-            records = self._sheet(sheet_name).get_all_records()
+            records = con_reintentos(self._sheet(sheet_name).get_all_records)
             self.ultimo_error = None
         except Exception as e:
             # Se guarda el error en vez de silenciarlo: antes, una cuota
@@ -325,20 +362,21 @@ class SheetsManager:
 
     def append(self, sheet_name: str, row: list):
         """Agrega una fila al final de la hoja."""
-        self._sheet(sheet_name).append_row(row, value_input_option="USER_ENTERED")
+        con_reintentos(self._sheet(sheet_name).append_row, row,
+                       value_input_option="USER_ENTERED")
         self._invalidar_cache(sheet_name)
 
     def update_cell(self, sheet_name: str, row: int, col: int, value):
         """Actualiza una celda (row/col base 1, fila 1 = encabezado)."""
-        self._sheet(sheet_name).update_cell(row, col, value)
+        con_reintentos(self._sheet(sheet_name).update_cell, row, col, value)
         self._invalidar_cache(sheet_name)
 
     def update_row(self, sheet_name: str, row_idx: int, data: list):
         """Actualiza la fila completa (row_idx base 1, fila 1 = encabezado)."""
         ncols = len(data)
         rango = f"A{row_idx}:{rowcol_to_a1(row_idx, ncols)}"
-        self._sheet(sheet_name).update(range_name=rango, values=[data],
-                                       value_input_option="USER_ENTERED")
+        con_reintentos(self._sheet(sheet_name).update, range_name=rango,
+                       values=[data], value_input_option="USER_ENTERED")
         self._invalidar_cache(sheet_name)
 
     def update_campos(self, sheet_name: str, row_idx: int, campos: dict):
@@ -355,7 +393,8 @@ class SheetsManager:
                 "values": [[str(valor)]],
             })
         if peticiones:
-            self._sheet(sheet_name).batch_update(peticiones, value_input_option="USER_ENTERED")
+            con_reintentos(self._sheet(sheet_name).batch_update, peticiones,
+                           value_input_option="USER_ENTERED")
             self._invalidar_cache(sheet_name)
 
     def _fila_de(self, sheet_name: str, id_col: str, id_val: str) -> int:

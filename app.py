@@ -11,6 +11,7 @@ from datetime import date, datetime, timedelta
 import html as _html
 from sheets_manager import (
     SheetsManager, CONFIG_DEFAULTS, ahora_local, hoy_local,
+    es_error_transitorio,
     EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO, TIPO_TARDANZA,
     CAUSALES_LLAMADO, GRAVEDAD_CAUSAL, TIPOS_RECONOCIMIENTO,
     password_debil,
@@ -679,14 +680,31 @@ def pantalla_login():
 
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        st.error("⚠️ **El sistema no está conectado a la base de datos.**")
-        st.markdown(
-            "Esto **no es un problema de tu usuario** y no necesitas ningún "
-            "archivo. Avisa al área de RRHH para que termine la configuración; "
-            "mientras tanto no podrás ingresar."
-        )
+        detalle = st.session_state.get("error_conexion") or ""
+        # Un 503 de Google es una caída pasajera de su servicio, no un problema
+        # de configuración: merece un mensaje distinto y un botón de reintento.
+        transitorio = bool(detalle) and es_error_transitorio(detalle)
 
-        detalle = st.session_state.get("error_conexion")
+        if transitorio:
+            st.warning("⏳ **Google no está respondiendo en este momento.**")
+            st.markdown(
+                "Es una interrupción temporal del servicio de Google Sheets, no "
+                "un problema de tu usuario ni de la configuración del sistema. "
+                "Suele durar poco.")
+            if st.button("🔄 Reintentar conexión", type="primary",
+                         use_container_width=True):
+                st.session_state.sm = None
+                st.session_state.error_conexion = None
+                st.session_state.pop("esquema_preparado", None)
+                st.rerun()
+            st.caption("Si después de varios minutos sigue igual, avisa a RRHH.")
+        else:
+            st.error("⚠️ **El sistema no está conectado a la base de datos.**")
+            st.markdown(
+                "Esto **no es un problema de tu usuario** y no necesitas ningún "
+                "archivo. Avisa al área de RRHH para que termine la configuración; "
+                "mientras tanto no podrás ingresar.")
+
         if detalle:
             with st.expander("🔍 Detalle técnico (para RRHH o sistemas)"):
                 st.code(detalle, language=None)

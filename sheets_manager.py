@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 # Segundos que se reutiliza una lectura de una hoja antes de volver a pedirla.
 # Google Sheets limita a ~60 lecturas por minuto y por usuario; sin esta caché
 # una sola pantalla puede gastar 5 o 6 lecturas y agotar la cuota.
-_CACHE_TTL = 15
+_CACHE_TTL = 90
 
 ZONA_POR_DEFECTO = "America/Guayaquil"
 
@@ -33,6 +33,16 @@ ESPERA_BASE_SEG = 1.5
 _ERRORES_TRANSITORIOS = ("503", "500", "502", "504", "429",
                          "currently unavailable", "internal error",
                          "backend error", "quota exceeded", "rate_limit")
+
+
+_ERRORES_CUOTA = ("429", "quota exceeded", "rate_limit", "resource_exhausted",
+                  "too many requests")
+
+
+def es_error_cuota(e) -> bool:
+    """True si Google rechazó la llamada por exceso de consultas."""
+    texto = f"{type(e).__name__}: {e}".lower()
+    return any(marca in texto for marca in _ERRORES_CUOTA)
 
 
 def es_error_transitorio(e) -> bool:
@@ -52,6 +62,11 @@ def con_reintentos(fn, *args, **kwargs):
         try:
             return fn(*args, **kwargs)
         except Exception as e:
+            # La cuota agotada NO se reintenta: cada reintento consume otra
+            # llamada del mismo minuto y hunde más el límite. Se propaga de
+            # una vez para que la pantalla lo explique y la persona espere.
+            if es_error_cuota(e):
+                raise
             if not es_error_transitorio(e) or intento == REINTENTOS_MAX - 1:
                 raise
             ultimo = e
@@ -512,36 +527,52 @@ class SheetsManager:
         # fallo de la API con "no hay datos".
         self._cache = {}
         self.ultimo_error = None
+        self._hojas_cache = None      # lista de pestañas, se pide una sola vez
+        self._precarga_seg = 0        # cuándo se leyeron todas las hojas juntas
 
     # ── Helpers de bajo nivel ────────────────────────────────────────────────
 
-    def _sheet(self, name: str):
-        return self.spreadsheet.worksheet(name)
+    def _hojas(self, refrescar: bool = False) -> dict:
+        """Pestañas del archivo, pedidas UNA sola vez por sesión.
 
-    def _invalidar_cache(self, sheet_name: str = None):
-        """Descarta la lectura guardada tras escribir en una hoja."""
-        if sheet_name:
-            self._cache.pop(sheet_name, None)
-        else:
-            self._cache.clear()
-
-    def _leer_crudo(self, sheet_name: str) -> list:
-        """Lee la hoja celda por celda cuando el encabezado no es utilizable.
-
-        Resuelve los dos casos que rompen a gspread: encabezados repetidos
-        —al segundo se le añade un sufijo— y celdas de encabezado vacías, que
-        se descartan junto con su columna. Así una hoja con una columna de
-        sobra sigue leyéndose completa en vez de no leerse nada.
+        gspread consulta la lista de pestañas al servidor en cada llamada a
+        worksheet(); con catorce hojas eso era la mitad del consumo de cuota.
         """
-        valores = con_reintentos(self._sheet(sheet_name).get_all_values)
+        if refrescar or getattr(self, "_hojas_cache", None) is None:
+            self._hojas_cache = {ws.title: ws
+                                 for ws in con_reintentos(self.spreadsheet.worksheets)}
+        return self._hojas_cache
+
+    def _sheet(self, name: str):
+        hojas = self._hojas()
+        if name not in hojas:
+            hojas = self._hojas(refrescar=True)   # quizá se acaba de crear
+        if name not in hojas:
+            raise gspread.exceptions.WorksheetNotFound(name)
+        return hojas[name]
+
+    def _df_desde_valores(self, sheet_name: str, valores: list) -> pd.DataFrame:
+        """Arma la tabla desde las celdas en crudo.
+
+        Resuelve los dos casos que rompen la lectura estándar: encabezados
+        repetidos —al segundo se le añade un sufijo— y encabezados en blanco,
+        cuya columna se descarta. Así una hoja con una columna de sobra se
+        sigue leyendo entera en vez de no leerse nada.
+        """
+        esperadas = HEADERS.get(sheet_name, [])
         if not valores:
-            return []
+            return pd.DataFrame(columns=esperadas)
         cabecera = [str(c).strip() for c in valores[0]]
         usados, columnas = {}, []
-        for i, nombre in enumerate(cabecera):
+        for nombre in cabecera:
             if not nombre:
-                columnas.append(None)          # columna sin nombre: se ignora
+                columnas.append(None)
                 continue
+            # Nombres equivalentes salvo mayúsculas se llevan al nombre oficial
+            for exp in esperadas:
+                if nombre.lower() == exp.lower():
+                    nombre = exp
+                    break
             if nombre in usados:
                 usados[nombre] += 1
                 nombre = f"{nombre}_{usados[nombre]}"
@@ -551,70 +582,89 @@ class SheetsManager:
         registros = []
         for fila in valores[1:]:
             if not any(str(c).strip() for c in fila):
-                continue                        # fila totalmente vacía
+                continue                       # fila totalmente en blanco
             reg = {}
             for i, nombre in enumerate(columnas):
-                if nombre is None:
-                    continue
-                reg[nombre] = fila[i] if i < len(fila) else ""
+                if nombre is not None:
+                    reg[nombre] = fila[i] if i < len(fila) else ""
             if reg:
                 registros.append(reg)
-        return registros
+        if not registros:
+            return pd.DataFrame(columns=esperadas)
+        df = pd.DataFrame(registros)
+        for exp in esperadas:
+            if exp not in df.columns:
+                df[exp] = ""
+        return df
+
+    def precargar(self, forzar: bool = False) -> bool:
+        """Lee TODAS las hojas en una sola llamada a la API.
+
+        Es la diferencia entre gastar catorce lecturas del minuto y gastar
+        una. Google cobra por llamada, no por cantidad de datos, así que traer
+        todo junto sale mucho más barato que pedir hoja por hoja.
+        """
+        ahora_seg = time.time()
+        if not forzar and (ahora_seg - getattr(self, "_precarga_seg", 0)) < _CACHE_TTL:
+            return True
+        try:
+            hojas = self._hojas()
+            nombres = [n for n in HEADERS if n in hojas]
+            if not nombres:
+                return False
+            resp = con_reintentos(self.spreadsheet.values_batch_get,
+                                  [f"'{n}'" for n in nombres])
+            rangos = resp.get("valueRanges", [])
+            for nombre, rango in zip(nombres, rangos):
+                df = self._df_desde_valores(nombre, rango.get("values", []) or [])
+                self._cache[nombre] = (ahora_seg, df)
+            self._precarga_seg = ahora_seg
+            self.ultimo_error = None
+            return True
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            return False
+
+    def _invalidar_cache(self, sheet_name: str = None):
+        """Descarta la lectura guardada tras escribir en una hoja."""
+        if sheet_name:
+            self._cache.pop(sheet_name, None)
+        else:
+            self._cache.clear()
+        # La próxima lectura debe volver a traer los datos de Google, no
+        # servir la foto anterior: si no, quien acaba de guardar no ve lo suyo.
+        self._precarga_seg = 0
 
     def get_df(self, sheet_name: str, usar_cache: bool = True) -> pd.DataFrame:
-        """Lee la hoja y devuelve DataFrame. Normaliza nombres de columnas.
+        """Lee la hoja y devuelve un DataFrame con las columnas esperadas.
 
-        Reutiliza la última lectura durante _CACHE_TTL segundos: una sola
-        pantalla puede consultar la misma hoja varias veces y Google Sheets
-        corta el acceso al pasarse de cuota.
+        No pide la hoja suelta: pide TODAS de una vez y se queda con la que
+        hace falta. Una pantalla que consulta seis hojas cuesta entonces una
+        llamada, no seis, que es lo que agotaba la cuota del minuto.
         """
         if usar_cache:
             guardado = self._cache.get(sheet_name)
             if guardado and (time.time() - guardado[0]) < _CACHE_TTL:
                 return guardado[1].copy()
 
+        if self.precargar(forzar=not usar_cache):
+            guardado = self._cache.get(sheet_name)
+            if guardado:
+                return guardado[1].copy()
+
+        # La lectura por lotes no funcionó. Último intento con la hoja suelta,
+        # salvo que el problema sea la cuota: ahí insistir solo la empeora.
+        if es_error_cuota(Exception(self.ultimo_error or "")):
+            return pd.DataFrame(columns=HEADERS[sheet_name])
         try:
-            records = con_reintentos(self._sheet(sheet_name).get_all_records)
+            valores = con_reintentos(self._sheet(sheet_name).get_all_values)
+            df = self._df_desde_valores(sheet_name, valores)
+            self._cache[sheet_name] = (time.time(), df)
             self.ultimo_error = None
+            return df.copy()
         except Exception as e:
-            # get_all_records exige que la fila 1 tenga nombres únicos y no
-            # vacíos. Una hoja que se ha editado a mano casi siempre termina
-            # con una columna repetida o una celda en blanco al final, y
-            # entonces revienta la lectura ENTERA: la pantalla se ve como si
-            # no hubiera datos, cuando los datos están ahí.
-            # Segundo intento leyendo las celdas en crudo y armando la tabla
-            # nosotros mismos, que es lo que debió hacerse desde el principio.
-            try:
-                records = self._leer_crudo(sheet_name)
-                self.ultimo_error = None
-            except Exception as e2:
-                # Se guarda el error en vez de silenciarlo: antes, una cuota
-                # agotada de la API se veía en pantalla como "no hay datos".
-                self.ultimo_error = f"{type(e).__name__}: {e}"
-                if type(e2) is not type(e) or str(e2) != str(e):
-                    self.ultimo_error += f" | segundo intento: {type(e2).__name__}: {e2}"
-                return pd.DataFrame(columns=HEADERS[sheet_name])
-
-        if records:
-            df = pd.DataFrame(records)
-            # Normalizar columnas al formato esperado (case-insensitive)
-            expected = HEADERS.get(sheet_name, [])
-            rename_map = {}
-            for col in df.columns:
-                for exp in expected:
-                    if col.lower() == exp.lower() and col != exp:
-                        rename_map[col] = exp
-            if rename_map:
-                df = df.rename(columns=rename_map)
-            # Garantizar que existan todas las columnas esperadas (hojas antiguas)
-            for exp in expected:
-                if exp not in df.columns:
-                    df[exp] = ""
-        else:
-            df = pd.DataFrame(columns=HEADERS[sheet_name])
-
-        self._cache[sheet_name] = (time.time(), df)
-        return df.copy()
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            return pd.DataFrame(columns=HEADERS[sheet_name])
 
     def append(self, sheet_name: str, row: list):
         """Agrega una fila al final de la hoja."""
@@ -675,7 +725,13 @@ class SheetsManager:
         except Exception:
             return
         try:
-            actuales = [str(c).strip() for c in sheet.row_values(1)]
+            # El encabezado sale de la precarga cuando ya se hizo, para no
+            # gastar una llamada por hoja solo en mirar la primera fila.
+            guardado = self._cache.get(sheet_name)
+            if guardado is not None:
+                actuales = [c for c in guardado[1].columns]
+            else:
+                actuales = [str(c).strip() for c in sheet.row_values(1)]
         except Exception:
             actuales = []
         if not actuales:
@@ -692,17 +748,18 @@ class SheetsManager:
                      values=[nuevos], value_input_option="USER_ENTERED")
 
     def migrar_esquema(self):
-        """Asegura que Permisos y Vacaciones tengan las columnas del flujo de
-        doble aprobación. Es idempotente: si ya están, no hace nada."""
+        """Asegura que las hojas tengan las columnas que el sistema espera.
+
+        Es idempotente: si ya están, no escribe nada. Empieza por una lectura
+        por lotes para saber qué encabezado tiene cada hoja con una sola
+        llamada, en vez de una por hoja.
+        """
+        self.precargar()
         for hoja in ("Permisos", "Vacaciones", "Empleados", "Asistencia"):
             try:
                 self.ensure_columns(hoja)
             except Exception:
                 pass
-        try:
-            self.ensure_hojas_riesgo()
-        except Exception:
-            pass
 
     # ── Configuración ────────────────────────────────────────────────────────
 
@@ -1453,48 +1510,56 @@ class SheetsManager:
                     pass
 
     def diagnostico_hojas(self) -> list:
-        """Estado de cada hoja: cuántas filas tiene y si se pudo leer.
+        """Estado de cada hoja: cuántas filas tiene y si se puede leer.
 
-        Sirve para distinguir de un vistazo entre 'la hoja está vacía' y 'la
-        hoja no se pudo leer', que en pantalla se veían igual.
+        Sirve para distinguir de un vistazo entre "la hoja está vacía" y "la
+        hoja no se pudo leer", que en pantalla se veían igual. Todo sale de
+        una sola llamada por lotes para no gastar cuota justo cuando se está
+        diagnosticando un problema de cuota.
         """
         salida = []
+        try:
+            hojas = self._hojas(refrescar=True)
+        except Exception as e:
+            return [{"Hoja": n, "Filas": 0, "Estado": "❌ No se pudo consultar",
+                     "Detalle": f"{type(e).__name__}: {e}"} for n in HEADERS]
+
+        presentes = [n for n in HEADERS if n in hojas]
+        crudos = {}
+        try:
+            resp = con_reintentos(self.spreadsheet.values_batch_get,
+                                  [f"'{n}'" for n in presentes])
+            for nombre, rango in zip(presentes, resp.get("valueRanges", [])):
+                crudos[nombre] = rango.get("values", []) or []
+        except Exception as e:
+            return [{"Hoja": n, "Filas": 0, "Estado": "❌ No se pudo leer",
+                     "Detalle": f"{type(e).__name__}: {e}"} for n in HEADERS]
+
         for nombre in HEADERS:
             fila = {"Hoja": nombre, "Filas": 0, "Estado": "", "Detalle": ""}
-            try:
-                ws = self._sheet(nombre)
-            except Exception as e:
+            if nombre not in hojas:
                 fila["Estado"] = "❌ No existe la pestaña"
-                fila["Detalle"] = f"{type(e).__name__}: {e}"
+                fila["Detalle"] = "Se creará sola al reiniciar la aplicación."
                 salida.append(fila)
                 continue
-            try:
-                valores = con_reintentos(ws.get_all_values)
-            except Exception as e:
-                fila["Estado"] = "❌ No se pudo leer"
-                fila["Detalle"] = f"{type(e).__name__}: {e}"
-                salida.append(fila)
-                continue
+            valores = crudos.get(nombre, [])
             cabecera = [str(c).strip() for c in (valores[0] if valores else [])]
             datos = [f for f in valores[1:] if any(str(c).strip() for c in f)]
             fila["Filas"] = len(datos)
-            problemas = []
-            vistos = set()
+
+            problemas, vistos = [], set()
             for c in cabecera:
                 if c and c in vistos:
                     problemas.append(f"encabezado repetido: {c}")
                 vistos.add(c)
-            vacias = sum(1 for i, c in enumerate(cabecera) if not c)
+            vacias = sum(1 for c in cabecera if not c)
             if vacias:
                 problemas.append(f"{vacias} encabezado(s) en blanco")
             faltan = [c for c in HEADERS[nombre] if c not in cabecera]
             if faltan:
                 problemas.append("faltan columnas: " + ", ".join(faltan))
-            if problemas:
-                fila["Estado"] = "⚠️ Se lee, con avisos"
-                fila["Detalle"] = " · ".join(problemas)
-            else:
-                fila["Estado"] = "✅ Correcta"
+            fila["Estado"] = "⚠️ Se lee, con avisos" if problemas else "✅ Correcta"
+            fila["Detalle"] = " · ".join(problemas)
             salida.append(fila)
         return salida
 

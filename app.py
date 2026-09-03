@@ -362,6 +362,12 @@ def sin_datos(mensaje: str, tipo: str = "info"):
                 "rrhh-196@rrhh-507215.iam.gserviceaccount.com.")
     with st.expander("🔍 Detalle técnico"):
         st.code(detalle, language=None)
+    if st.button("🔄 Volver a intentar", key=f"reint_{abs(hash(mensaje)) % 10**8}"):
+        try:
+            sm._invalidar_cache()
+        except Exception:
+            pass
+        st.rerun()
     return True
 
 

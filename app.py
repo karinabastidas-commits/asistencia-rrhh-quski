@@ -14,7 +14,7 @@ from sheets_manager import (
     es_error_transitorio, leer_formulario_kye,
     EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO, TIPO_TARDANZA,
     CAUSALES_LLAMADO, GRAVEDAD_CAUSAL, TIPOS_RECONOCIMIENTO,
-    CATEGORIAS_DOCUMENTO, TIPOS_DOC_KYE, ESTADOS_CURSO,
+    CATEGORIAS_DOCUMENTO, TIPOS_DOC_KYE, ESTADOS_CURSO, CAMPOS_BLOQUEO_BPM,
     FINANCIAMIENTO_CURSO, NIVELES_TITULO,
     password_debil,
 )
@@ -1476,6 +1476,14 @@ def page_configuracion():
             tard_suspension = num_config("Suspensión", config,
                 "Tardanzas_Suspension", 8, 1, 99)
 
+        st.subheader("🔒 Control de datos en el BPM")
+        email_tec = st.text_input(
+            "Correo del área de sistemas", value=config.get("Email_Tecnologia", ""),
+            help="Recibe los datos de contacto del personal para bloquearlos en el "
+                 "BPM, de modo que no puedan usarse al registrar un cliente.")
+        st.caption("Se envía automáticamente al guardar una ficha KYE, y solo "
+                   "cuando hay datos nuevos o que cambiaron.")
+
         st.subheader("📂 Repositorio de documentos")
         st.caption("Los archivos del personal se guardan en una carpeta de Google "
                    "Drive; en la hoja solo queda el enlace.")
@@ -1555,6 +1563,7 @@ def page_configuracion():
                 "Riesgo_Peso_Antiguedad":      str(w_ant),
                 "Riesgo_Peso_Formacion":       str(w_for),
                 "Drive_Carpeta_ID":            drive_id.strip(),
+                "Email_Tecnologia":            email_tec.strip(),
                 "Buro_Score_Bueno":            str(buro_bueno),
                 "Buro_Score_Malo":             str(buro_malo),
                 "Riesgo_Umbral_Medio":         str(u_med),
@@ -2600,6 +2609,98 @@ def panel_riesgo(sm, config, emp_id, compacto: bool = False):
     return ev
 
 
+def diff_bloqueo_bpm(sm, emp_id, datos):
+    """Qué datos de contacto hay que bloquear, frente a los ya registrados.
+
+    Se calcula ANTES de guardar, que es el único momento en que todavía se
+    pueden ver los datos anteriores. Si la lectura falla, se devuelve un diff
+    tratando todo como nuevo: es preferible que sistemas reciba una solicitud
+    de más a que un celular quede sin bloquear.
+    """
+    try:
+        return sm.comparar_datos_bloqueo(emp_id, datos)
+    except Exception:
+        altas = [(et, str(datos.get(c, "") or "").strip())
+                 for c, et in CAMPOS_BLOQUEO_BPM
+                 if str(datos.get(c, "") or "").strip()]
+        return {"nuevos": altas, "cambiados": [], "sin_cambio": [],
+                "hay_cambios": bool(altas), "es_primera_vez": True}
+
+
+def avisar_bloqueo_bpm(sm, config, emp_id, nombre_emp, datos, quien, cmp_=None):
+    """Pide a sistemas bloquear los datos de contacto del empleado en el BPM.
+
+    Control antifraude: si un asesor pudiera registrar un cliente con su propio
+    celular, correo o dirección, tendría cómo tramitarse una operación a sí
+    mismo. Sistemas los marca como no utilizables en el BPM.
+
+    Solo se envía cuando hay algo nuevo o cambiado, para no llenar de correos
+    repetidos a tecnología cada vez que se corrige una coma en la ficha.
+    """
+    destino = str(config.get("Email_Tecnologia", "") or "").strip()
+    if not destino:
+        st.warning("⚠️ No hay correo de sistemas configurado, así que no se pudo "
+                   "solicitar el bloqueo de datos. Configúralo en Configuración.")
+        return False
+
+    if cmp_ is None:
+        cmp_ = diff_bloqueo_bpm(sm, emp_id, datos)
+    if not cmp_["hay_cambios"]:
+        return False   # nada nuevo que bloquear
+
+    filas = [("Empleado", f"{emp_id} – {nombre_emp}"),
+             ("Cédula", datos.get("Cedula", "") or "—"),
+             ("Registrado por", quien),
+             ("Fecha", ahora().strftime("%d/%m/%Y %H:%M"))]
+
+    cuerpo = [f"<p>Solicitud de <strong>bloqueo de datos en el BPM</strong> para "
+              f"<strong>{esc(nombre_emp)}</strong>, personal de la empresa.</p>",
+              tabla_html(filas)]
+
+    if cmp_["nuevos"]:
+        cuerpo.append("<h3 style='margin-top:20px;font-size:15px'>🔒 Bloquear "
+                      "(datos nuevos)</h3>")
+        cuerpo.append(tabla_html(cmp_["nuevos"]))
+
+    if cmp_["cambiados"]:
+        cuerpo.append("<h3 style='margin-top:20px;font-size:15px'>🔄 Cambiaron: "
+                      "liberar el anterior y bloquear el nuevo</h3>")
+        cuerpo.append(tabla_html(
+            [(f"{et} — ANTES", antes) for et, antes, _ in cmp_["cambiados"]] +
+            [(f"{et} — AHORA", ahora_v) for et, _, ahora_v in cmp_["cambiados"]]))
+
+    cuerpo.append(
+        "<p style='margin-top:20px;padding:12px;background:#FEF3C7;"
+        "border-left:4px solid #D97706'><strong>Acción solicitada:</strong> marcar "
+        "estos datos como no utilizables en el registro de clientes del BPM. "
+        "Un cliente no puede tener el correo, teléfono o dirección de un empleado: "
+        "sería una señal de operación tramitada por el propio asesor.</p>")
+    cuerpo.append("<p style='color:#6B7280;font-size:13px'>Generado automáticamente "
+                  "al registrar la ficha Conozca a su Empleado.</p>")
+
+    asunto = (f"Bloqueo de datos en BPM – {nombre_emp}" if cmp_["es_primera_vez"]
+              else f"ACTUALIZACIÓN de datos a bloquear en BPM – {nombre_emp}")
+    enviados, fallidos = notificar([destino, config.get("Email_RRHH", "")],
+                                   asunto, "".join(cuerpo))
+    if enviados:
+        n_alta, n_cam = len(cmp_["nuevos"]), len(cmp_["cambiados"])
+        detalle = []
+        if n_alta: detalle.append(f"{n_alta} dato(s) nuevo(s)")
+        if n_cam:  detalle.append(f"{n_cam} cambiado(s)")
+        flash("info", f"🔒 Se pidió a sistemas bloquear en el BPM "
+                      f"{' y '.join(detalle)}. Notificado a: " + ", ".join(enviados))
+        try:
+            sm.marcar_aviso_tecnologia(
+                emp_id, f"{ahora().strftime('%Y-%m-%d %H:%M')} · {' y '.join(detalle)}")
+        except Exception:
+            pass
+        return True
+    if fallidos:
+        flash("warning", "⚠️ No se pudo avisar a sistemas para el bloqueo en el BPM: "
+                         + ", ".join(fallidos) + ". Reenvía desde la ficha KYE.")
+    return False
+
+
 def page_riesgo_operativo():
     sm = get_sm()
     config = st.session_state.config
@@ -2664,6 +2765,41 @@ def page_riesgo_operativo():
         if k:
             st.success(f"✅ Ficha registrada · última actualización: "
                        f"{k.get('Actualizado', '—')}")
+            aviso = str(k.get("Aviso_Tecnologia", "") or "").strip()
+            cbox1, cbox2 = st.columns([3, 1])
+            with cbox1:
+                if aviso:
+                    st.caption(f"🔒 Bloqueo en BPM solicitado a sistemas: {aviso}")
+                else:
+                    st.warning("⚠️ Todavía no se ha pedido a sistemas bloquear los "
+                               "datos de contacto de esta persona en el BPM.")
+            with cbox2:
+                if st.button("🔒 Reenviar a sistemas", key=f"reenv_{emp_id}",
+                             use_container_width=True):
+                    actuales = {c: k.get(c, "") for c, _ in CAMPOS_BLOQUEO_BPM}
+                    actuales["Cedula"] = k.get("Cedula", "")
+                    destino = str(config.get("Email_Tecnologia", "") or "").strip()
+                    filas = [("Empleado", f"{emp_id} – {sel.split(' – ')[-1]}"),
+                             ("Cédula", actuales.get("Cedula", "") or "—")]
+                    filas += [(et, k.get(c, "") or "—") for c, et in CAMPOS_BLOQUEO_BPM]
+                    cuerpo = (f"<p>Reenvío de la solicitud de <strong>bloqueo de datos "
+                              f"en el BPM</strong> para <strong>"
+                              f"{esc(sel.split(' – ')[-1])}</strong>.</p>"
+                              + tabla_html(filas) +
+                              "<p style='margin-top:16px;padding:12px;background:#FEF3C7;"
+                              "border-left:4px solid #D97706'><strong>Acción "
+                              "solicitada:</strong> marcar estos datos como no "
+                              "utilizables en el registro de clientes del BPM.</p>")
+                    env, fal = notificar([destino, config.get("Email_RRHH", "")],
+                                         f"Bloqueo de datos en BPM – "
+                                         f"{sel.split(' – ')[-1]} (reenvío)", cuerpo)
+                    if env:
+                        sm.marcar_aviso_tecnologia(
+                            emp_id, f"{ahora().strftime('%Y-%m-%d %H:%M')} · reenvío manual")
+                        flash("info", "🔒 Reenviado a: " + ", ".join(env))
+                    else:
+                        flash("warning", "No se pudo reenviar: " + ", ".join(fal))
+                    st.rerun()
         else:
             st.info("Este empleado todavía no tiene ficha. Puedes subir su "
                     "formulario en Excel o llenarla a mano abajo.")
@@ -2825,14 +2961,28 @@ def page_riesgo_operativo():
                     "Registrado_Por": str(usuario.get("nombre", "")) if usuario else "",
                     **docs,
                 }
+                # La comparación se hace ANTES de guardar, que es cuando
+                # todavía se ven los datos anteriores; el correo sale DESPUÉS,
+                # para que una falla de envío nunca impida guardar la ficha.
+                cmp_bpm = diff_bloqueo_bpm(sm, emp_id, datos)
                 try:
                     with st.spinner("Guardando…"):
                         sm.guardar_kye(emp_id, datos)
                     st.session_state.pop(f"kye_pre_{emp_id}", None)
                     flash("success", f"✅ Ficha KYE de **{sel}** guardada.")
-                    st.rerun()
                 except Exception as e:
                     st.error(f"❌ No se pudo guardar: {e}")
+                else:
+                    try:
+                        avisar_bloqueo_bpm(sm, config, emp_id,
+                                           sel.split(" – ")[-1], datos,
+                                           str(usuario.get("nombre", "")) if usuario else "",
+                                           cmp_bpm)
+                    except Exception as e:
+                        flash("warning", f"La ficha quedó guardada, pero no se pudo "
+                                         f"avisar a sistemas para el bloqueo en el "
+                                         f"BPM ({e}). Usa «Reenviar a sistemas».")
+                    st.rerun()
 
     # ── Score de buró ────────────────────────────────────────────────────────
     elif seccion == et_bur:

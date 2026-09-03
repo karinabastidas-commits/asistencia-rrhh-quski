@@ -123,7 +123,8 @@ HEADERS = {
                      "Doc_Papeleta", "Doc_Papeleta_Conyuge", "Doc_Ref_Laborales",
                      "Doc_Ref_Personales", "Doc_Servicio_Basico",
                      "Doc_Declaracion_Patrimonial",
-                     "Fecha_Formulario", "Observaciones", "Registrado_Por", "Actualizado"],
+                     "Fecha_Formulario", "Observaciones", "Registrado_Por", "Actualizado",
+                     "Aviso_Tecnologia"],
     "Score_Buro": ["ID_Score", "ID_Empleado", "Fecha", "Score", "Tipo", "Fuente",
                    "Observaciones", "Registrado_Por"],
     "Reconocimientos": ["ID_Reconocimiento", "Fecha", "ID_Empleado", "Nombre", "Tipo",
@@ -228,7 +229,20 @@ CONFIG_DEFAULTS = {
     # Debe ser de una persona real y estar compartida como Editor con la
     # cuenta de servicio: los service accounts no tienen espacio propio.
     "Drive_Carpeta_ID":               "",
+    # Área de sistemas: recibe los datos de contacto del personal para
+    # bloquearlos en el BPM y que nadie pueda usarlos en un cliente.
+    "Email_Tecnologia":               "tecnologia@quski.ec",
 }
+
+# Datos de contacto personales del empleado que sistemas debe bloquear en el
+# BPM. Si un asesor pudiera registrar un cliente con su propio celular o
+# dirección, tendría cómo autogestionarse una operación.
+CAMPOS_BLOQUEO_BPM = [
+    ("Email_Personal",     "Correo electrónico personal"),
+    ("Celular",            "Número de celular"),
+    ("Telefono_Domicilio", "Teléfono de domicilio"),
+    ("Direccion",          "Dirección de domicilio"),
+]
 
 # ── Estados del flujo de aprobación ───────────────────────────────────────────
 # Pendiente_Jefe  → esperando al jefe inmediato
@@ -1397,6 +1411,41 @@ class SheetsManager:
         mask = df["ID_Empleado"].astype(str).str.strip() == str(id_empleado).strip()
         filas = df[mask]
         return filas.iloc[-1].to_dict() if not filas.empty else {}
+
+    def comparar_datos_bloqueo(self, id_empleado: str, nuevos: dict) -> dict:
+        """Compara los datos de contacto con los que ya estaban registrados.
+
+        Devuelve {"nuevos": [...], "cambiados": [(etiqueta, antes, ahora)],
+                  "sin_cambio": [...], "hay_cambios": bool}
+        para que el aviso a sistemas diga qué bloquear y qué liberar.
+        """
+        previo = self.get_kye(id_empleado)
+        altas, cambios, iguales = [], [], []
+        for campo, etiqueta in CAMPOS_BLOQUEO_BPM:
+            antes  = str(previo.get(campo, "") or "").strip()
+            ahora  = str(nuevos.get(campo, "") or "").strip()
+            if not ahora:
+                continue
+            if not antes:
+                altas.append((etiqueta, ahora))
+            elif antes.lower() != ahora.lower():
+                cambios.append((etiqueta, antes, ahora))
+            else:
+                iguales.append((etiqueta, ahora))
+        return {"nuevos": altas, "cambiados": cambios, "sin_cambio": iguales,
+                "hay_cambios": bool(altas or cambios),
+                "es_primera_vez": not bool(previo)}
+
+    def marcar_aviso_tecnologia(self, id_empleado: str, texto: str):
+        """Deja constancia de cuándo se avisó a sistemas."""
+        df = self.get_df("KYE_Empleado")
+        if df.empty or "ID_Empleado" not in df.columns:
+            return
+        ids = df["ID_Empleado"].astype(str).str.strip().tolist()
+        if str(id_empleado).strip() not in ids:
+            return
+        fila = ids.index(str(id_empleado).strip()) + 2
+        self.update_campos("KYE_Empleado", fila, {"Aviso_Tecnologia": texto})
 
     def guardar_kye(self, id_empleado: str, datos: dict):
         """Crea o actualiza la ficha KYE del empleado."""

@@ -493,19 +493,42 @@ def init_session():
             if cuenta is not None:
                 creds_dict = dict(cuenta)
                 sm = SheetsManager(creds_dict)
-                sm.ensure_usuarios_sheet()
-                sm.ensure_llamados_sheet()
-                # Agrega a Permisos y Vacaciones las columnas del flujo de doble
-                # aprobación si la hoja viene de una versión anterior. Es
-                # idempotente y debe correr ANTES de escribir cualquier solicitud.
-                sm.migrar_esquema()
-                sm.ensure_hojas_riesgo()
-                st.session_state.sm = sm
+                # La conexión se da por buena en cuanto se puede leer la
+                # configuración. Todo lo demás (crear hojas, agregar columnas)
+                # es preparación del esquema y se hace aparte: si algo de eso
+                # falla —por ejemplo por cuota de la API de Google— NO debe
+                # dejar a todo el personal sin poder entrar al sistema.
                 st.session_state.config = sm.get_config()
+                st.session_state.sm = sm
+                st.session_state.error_conexion = None
+                preparar_esquema(sm)
         except Exception as e:
-            # No se silencia del todo: se guarda para poder mostrarlo en la
-            # pantalla de conexión en lugar de fallar sin explicación.
-            st.session_state.error_conexion = f"{type(e).__name__}: {e}"
+            import traceback
+            st.session_state.error_conexion = (
+                f"{type(e).__name__}: {e}\n\n" + traceback.format_exc())
+
+
+def preparar_esquema(sm):
+    """Crea hojas y columnas que falten, sin poner en riesgo la conexión.
+
+    Cada paso va por separado: si uno falla (cuota de la API agotada, permisos,
+    una hoja bloqueada) los demás siguen y el sistema queda utilizable. Los
+    fallos se guardan para mostrárselos al administrador, no al empleado.
+    """
+    if st.session_state.get("esquema_preparado"):
+        return
+    fallos = []
+    pasos = [("hoja Usuarios",          sm.ensure_usuarios_sheet),
+             ("hoja Llamados",          sm.ensure_llamados_sheet),
+             ("columnas nuevas",        sm.migrar_esquema),
+             ("hojas de riesgo y KYE",  sm.ensure_hojas_riesgo)]
+    for nombre, fn in pasos:
+        try:
+            fn()
+        except Exception as e:
+            fallos.append(f"{nombre}: {type(e).__name__}: {e}")
+    st.session_state.esquema_preparado = True
+    st.session_state.fallos_esquema = fallos
 
 
 def get_sm() -> SheetsManager | None:
@@ -626,12 +649,9 @@ def etiqueta_estado_corta(estado) -> str:
 def conectar_sheets(creds_dict: dict):
     try:
         sm = SheetsManager(creds_dict)
-        sm.ensure_usuarios_sheet()
-        sm.ensure_llamados_sheet()
-        sm.migrar_esquema()
-        sm.ensure_hojas_riesgo()
-        st.session_state.sm = sm
         st.session_state.config = sm.get_config()
+        st.session_state.sm = sm
+        preparar_esquema(sm)
         return True
     except Exception as e:
         # Se muestra el tipo de error, no la traza completa: esta pantalla es
@@ -3210,6 +3230,16 @@ def main():
     if get_usuario() is None:
         pantalla_login_empleado()
         return
+
+    fallos = st.session_state.get("fallos_esquema") or []
+    if fallos and es_admin() and not st.session_state.get("fallos_avisados"):
+        st.session_state.fallos_avisados = True
+        st.warning("⚠️ El sistema conectó bien, pero algunos pasos de preparación "
+                   "de la hoja de cálculo fallaron. Suele ser cuota de la API de "
+                   "Google: vuelve a cargar en un minuto y se completan solos.")
+        with st.expander("🔍 Qué falló"):
+            for f in fallos:
+                st.code(f, language=None)
 
     registrar_entrada_automatica()
 

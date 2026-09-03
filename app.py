@@ -1333,20 +1333,65 @@ def page_asistencia():
 
 
 # ── Módulo: Configuración ─────────────────────────────────────────────────────
-def _cfg_int(config: dict, key: str, default: int) -> int:
-    """Lee un entero del dict de config de forma segura."""
+def _cfg_int(config: dict, key: str, default: int,
+             minimo: int = None, maximo: int = None) -> int:
+    """Lee un entero de la configuración, acotado al rango permitido."""
     try:
-        return int(float(config.get(key, default)))
+        v = int(float(config.get(key, default)))
     except (ValueError, TypeError):
-        return default
+        v = default
+    if minimo is not None:
+        v = max(minimo, v)
+    if maximo is not None:
+        v = min(maximo, v)
+    return v
 
 
-def _cfg_float(config: dict, key: str, default: float) -> float:
-    """Lee un float del dict de config de forma segura."""
+def _cfg_float(config: dict, key: str, default: float,
+               minimo: float = None, maximo: float = None) -> float:
+    """Lee un decimal de la configuración, acotado al rango permitido."""
     try:
-        return float(config.get(key, default))
+        v = float(config.get(key, default))
     except (ValueError, TypeError):
-        return default
+        v = default
+    if minimo is not None:
+        v = max(minimo, v)
+    if maximo is not None:
+        v = min(maximo, v)
+    return v
+
+
+def num_config(etiqueta: str, config: dict, key: str, default, minimo, maximo,
+               paso=None, ayuda: str = None):
+    """Campo numérico ligado a un valor de configuración.
+
+    Toma el valor guardado y lo acota al rango del campo. Antes, un valor
+    fuera de rango en la hoja —por ejemplo 60 tardanzas con un tope de 30—
+    reventaba la pantalla entera de Configuración con
+    StreamlitValueAboveMaxError. Al usar la misma función para el rango y para
+    el valor, ambos no pueden quedar descoordinados.
+    """
+    es_entero = isinstance(default, int) and isinstance(minimo, int)
+    if es_entero:
+        v = _cfg_int(config, key, default, minimo, maximo)
+    else:
+        v = _cfg_float(config, key, float(default), float(minimo), float(maximo))
+        minimo, maximo = float(minimo), float(maximo)
+    kw = {"min_value": minimo, "max_value": maximo, "value": v}
+    if paso is not None:
+        kw["step"] = paso
+    if ayuda:
+        kw["help"] = ayuda
+    guardado = config.get(key, None)
+    campo = st.number_input(etiqueta, **kw)
+    # Si lo guardado no cabía en el rango, se avisa en vez de corregir en silencio
+    try:
+        if guardado not in (None, "") and abs(float(guardado) - float(v)) > 1e-9:
+            st.caption(f"⚠️ El valor guardado era **{guardado}**, fuera del rango "
+                       f"permitido ({minimo}–{maximo}). Se ajustó a **{v}**.")
+    except (ValueError, TypeError):
+        pass
+    return campo
 
 
 def _cfg_time(config: dict, key: str, default: str):
@@ -1369,17 +1414,16 @@ def page_configuracion():
         c1, c2 = st.columns(2)
         with c1:
             h_ini = st.time_input("Horario de entrada", _cfg_time(config, "Horario_Inicio", "09:00"))
-            tolerancia = st.number_input("Tolerancia (minutos)",
-                min_value=0, max_value=30, value=_cfg_int(config, "Tolerancia_Minutos", 0))
+            tolerancia = num_config("Tolerancia (minutos)", config,
+                "Tolerancia_Minutos", 0, 0, 120)
         with c2:
             h_fin = st.time_input("Horario de salida", _cfg_time(config, "Horario_Fin", "17:30"))
-            tol_salida = st.number_input("Tolerancia de salida (minutos)",
-                min_value=0, max_value=60,
-                value=_cfg_int(config, "Tolerancia_Salida_Minutos", 0),
-                help="Minutos antes del horario de fin que se toleran sin avisar al "
-                     "jefe. En 0, cualquier salida anticipada dispara el aviso.")
-            horas_perm = st.number_input("Horas de permiso mensual",
-                min_value=1.0, max_value=20.0, step=0.5, value=_cfg_float(config, "Horas_Permiso_Mensual", 3.0))
+            tol_salida = num_config("Tolerancia de salida (minutos)", config,
+                "Tolerancia_Salida_Minutos", 0, 0, 120,
+                ayuda="Minutos antes del horario de fin que se toleran sin avisar "
+                      "al jefe. En 0, cualquier salida anticipada dispara el aviso.")
+            horas_perm = num_config("Horas de permiso mensual", config,
+                "Horas_Permiso_Mensual", 3.0, 0.5, 80.0, paso=0.5)
 
         st.subheader("Contacto y zona horaria")
         email_rrhh = st.text_input("Email RRHH", config.get("Email_RRHH", "rrhh@quski.ec"))
@@ -1391,14 +1435,14 @@ def page_configuracion():
         st.caption("Número de tardanzas acumuladas en el mes que activan cada tipo de llamado de atención")
         d1, d2, d3 = st.columns(3)
         with d1:
-            tard_verbal   = st.number_input("Llamado Verbal", min_value=1, max_value=20,
-                value=_cfg_int(config, "Tardanzas_Llamado_Verbal", 3))
+            tard_verbal   = num_config("Llamado Verbal", config,
+                "Tardanzas_Llamado_Verbal", 3, 1, 99)
         with d2:
-            tard_escrito  = st.number_input("Llamado Escrito", min_value=1, max_value=20,
-                value=_cfg_int(config, "Tardanzas_Llamado_Escrito", 5))
+            tard_escrito  = num_config("Llamado Escrito", config,
+                "Tardanzas_Llamado_Escrito", 5, 1, 99)
         with d3:
-            tard_suspension = st.number_input("Suspensión", min_value=1, max_value=30,
-                value=_cfg_int(config, "Tardanzas_Suspension", 8))
+            tard_suspension = num_config("Suspensión", config,
+                "Tardanzas_Suspension", 8, 1, 99)
 
         st.subheader("📂 Repositorio de documentos")
         st.caption("Los archivos del personal se guardan en una carpeta de Google "
@@ -1417,52 +1461,44 @@ def page_configuracion():
                    "100, así que poner uno en cero lo elimina y redistribuye el resto.")
         w1, w2, w3 = st.columns(3)
         with w1:
-            w_buro = st.number_input("Score de buró", 0, 100,
-                _cfg_int(config, "Riesgo_Peso_Buro", 30))
-            w_pep = st.number_input("Condición PEP", 0, 100,
-                _cfg_int(config, "Riesgo_Peso_PEP", 10))
+            w_buro = num_config("Score de buró", config, "Riesgo_Peso_Buro", 30, 0, 100)
+            w_pep = num_config("Condición PEP", config, "Riesgo_Peso_PEP", 10, 0, 100)
         with w2:
-            w_doc = st.number_input("Documentación KYE", 0, 100,
-                _cfg_int(config, "Riesgo_Peso_Documentos", 15))
-            w_fam = st.number_input("Situación familiar", 0, 100,
-                _cfg_int(config, "Riesgo_Peso_Familiar", 10),
-                help="Estado civil, hijos y situación del cónyuge. Ponerlo en cero "
-                     "elimina ese factor del cálculo.")
+            w_doc = num_config("Documentación KYE", config, "Riesgo_Peso_Documentos", 15, 0, 100)
+            w_fam = num_config("Situación familiar", config, "Riesgo_Peso_Familiar", 10, 0, 100,
+                ayuda="Estado civil, hijos y situación del cónyuge. Ponerlo en cero "
+                      "elimina ese factor del cálculo.")
         with w3:
-            w_dis = st.number_input("Historial disciplinario", 0, 100,
-                _cfg_int(config, "Riesgo_Peso_Disciplina", 25))
-            w_ant = st.number_input("Antigüedad", 0, 100,
-                _cfg_int(config, "Riesgo_Peso_Antiguedad", 10))
-            w_for = st.number_input("Formación académica", 0, 100,
-                _cfg_int(config, "Riesgo_Peso_Formacion", 10),
-                help="Títulos validados y cursos recientes reducen el riesgo.")
+            w_dis = num_config("Historial disciplinario", config, "Riesgo_Peso_Disciplina", 25, 0, 100)
+            w_ant = num_config("Antigüedad", config, "Riesgo_Peso_Antiguedad", 10, 0, 100)
+            w_for = num_config("Formación académica", config, "Riesgo_Peso_Formacion", 10, 0, 100,
+                ayuda="Títulos validados y cursos recientes reducen el riesgo.")
         b1, b2, b3 = st.columns(3)
         with b1:
-            buro_bueno = st.number_input("Score de buró considerado bueno", 0, 1000,
-                _cfg_int(config, "Buro_Score_Bueno", 800))
+            buro_bueno = num_config("Score de buró considerado bueno", config,
+                "Buro_Score_Bueno", 800, 0, 1000)
         with b2:
-            buro_malo = st.number_input("Score de buró considerado deficiente", 0, 1000,
-                _cfg_int(config, "Buro_Score_Malo", 400))
+            buro_malo = num_config("Score de buró considerado deficiente", config,
+                "Buro_Score_Malo", 400, 0, 1000)
         with b3:
             st.caption("Umbrales de nivel sobre el puntaje 0-100")
-            u_med = st.number_input("Medio desde", 0, 100, _cfg_int(config, "Riesgo_Umbral_Medio", 30))
-            u_alt = st.number_input("Alto desde", 0, 100, _cfg_int(config, "Riesgo_Umbral_Alto", 55))
-            u_cri = st.number_input("Crítico desde", 0, 100, _cfg_int(config, "Riesgo_Umbral_Critico", 75))
+            u_med = num_config("Medio desde", config, "Riesgo_Umbral_Medio", 30, 0, 100)
+            u_alt = num_config("Alto desde", config, "Riesgo_Umbral_Alto", 55, 0, 100)
+            u_cri = num_config("Crítico desde", config, "Riesgo_Umbral_Critico", 75, 0, 100)
 
         st.subheader("🏖️ Vacaciones")
         st.caption("Días **calendario** (incluyen fines de semana), no días hábiles.")
         v1, v2, v3 = st.columns(3)
         with v1:
-            vac_base = st.number_input("Días por año", min_value=1, max_value=60,
-                value=_cfg_int(config, "Dias_Vacaciones_Base", 15))
+            vac_base = num_config("Días por año", config,
+                "Dias_Vacaciones_Base", 15, 1, 90)
         with v2:
-            vac_desde = st.number_input("Año en que empieza el día adicional",
-                min_value=1, max_value=40,
-                value=_cfg_int(config, "Anio_Inicio_Dia_Adicional", 5),
-                help="Desde este año de servicio se suma un día por cada año más.")
+            vac_desde = num_config("Año en que empieza el día adicional", config,
+                "Anio_Inicio_Dia_Adicional", 5, 1, 50,
+                ayuda="Desde este año de servicio se suma un día por cada año más.")
         with v3:
-            vac_techo = st.number_input("Máximo de días", min_value=1, max_value=90,
-                value=_cfg_int(config, "Max_Dias_Vacaciones", 30))
+            vac_techo = num_config("Máximo de días", config,
+                "Max_Dias_Vacaciones", 30, 1, 120)
 
         if st.form_submit_button("💾 Guardar configuración", type="primary"):
             updates = {

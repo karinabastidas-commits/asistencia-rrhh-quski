@@ -931,6 +931,43 @@ class SheetsManager:
             return False
         return str(id_empleado) in df["ID_Empleado"].astype(str).values
 
+    def estado_jornada(self, id_empleado: str, fecha: str) -> dict:
+        """Qué tiene marcado hoy esta persona: entrada, salida, ambas o nada.
+
+        Permite que la pantalla de asistencia abra donde la persona la
+        necesita, en vez de dejarla siempre frente al botón de entrada.
+        """
+        vacio = {"entrada": "", "salida": "", "estado": "", "completa": False}
+        df = self.get_asistencia(fecha)
+        if df.empty or "ID_Empleado" not in df.columns:
+            return vacio
+        fila = df[df["ID_Empleado"].astype(str).str.strip() == str(id_empleado).strip()]
+        if fila.empty:
+            return vacio
+        r = fila.iloc[-1]
+        ent = str(r.get("Hora_Entrada", "") or "").strip()
+        sal = str(r.get("Hora_Salida", "") or "").strip()
+        return {"entrada": ent, "salida": sal,
+                "estado": str(r.get("Estado", "") or "").strip(),
+                "completa": bool(ent and sal)}
+
+    def minutos_de_atraso(self, hora, config: dict) -> int:
+        """Minutos de atraso que generaría marcar la entrada a esa hora.
+
+        Se calcula igual que registrar_entrada, para poder advertirle a la
+        persona ANTES de que pulse el botón cuánto atraso va a quedar en su
+        expediente.
+        """
+        try:
+            inicio = str(config.get("Horario_Inicio", "09:00"))[:5]
+            tol = int(float(config.get("Tolerancia_Minutos", 0) or 0))
+            fmt = "%H:%M"
+            d = (datetime.strptime(str(hora)[:5], fmt)
+                 - datetime.strptime(inicio, fmt)).total_seconds() / 60
+            return int(max(0, d - tol))
+        except Exception:
+            return 0
+
     def registrar_entrada(self, id_empleado: str, nombre: str, hora_entrada: str, config: dict) -> tuple:
         """Registra la hora de entrada. Devuelve (estado, minutos_atraso)."""
         fecha = hoy_local(config).strftime("%Y-%m-%d")

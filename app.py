@@ -1229,15 +1229,40 @@ def page_asistencia():
     admin = es_admin()
     st.title("✅ Asistencia" if admin else "✅ Mi Asistencia")
 
-    tabs = ["⬆️ Registrar entrada", "⬇️ Registrar salida", "📊 Historial"]
-    if admin:
-        tabs.append("❌ Marcar ausencia")
-    tab_list = st.tabs(tabs)
-    tab1, tab2, tab3 = tab_list[0], tab_list[1], tab_list[2]
-    tab4 = tab_list[3] if admin else None
+    ET_ENT, ET_SAL = "⬆️ Registrar entrada", "⬇️ Registrar salida"
+    ET_HIS, ET_AUS = "📊 Historial", "❌ Marcar ausencia"
+    etiquetas = [ET_ENT, ET_SAL, ET_HIS] + ([ET_AUS] if admin else [])
 
     df_emp = sm.get_empleados()
     hoy_str = hoy().strftime("%Y-%m-%d")
+
+    # La pantalla abre donde la persona la necesita. Quien ya marcó entrada y
+    # le falta la salida viene justamente a eso: abrirle en «Registrar entrada»
+    # lo pone frente al botón equivocado.
+    if not admin and usuario and "sec_asistencia" not in st.session_state:
+        try:
+            emp_yo = str(usuario.get("id_empleado", "")).strip()
+            est = sm.estado_jornada(emp_yo, hoy_str)
+            if est["entrada"] and not est["salida"]:
+                st.session_state["sec_asistencia"] = ET_SAL
+            elif est["entrada"] and est["salida"]:
+                st.session_state["sec_asistencia"] = ET_HIS
+        except Exception:
+            pass
+
+    seccion = secciones(etiquetas, "sec_asistencia")
+    st.divider()
+
+    class _Nada:
+        """Sustituye al contexto de pestaña: el bloque se dibuja o no."""
+        def __init__(self, activo): self.activo = activo
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    tab1 = _Nada(seccion == ET_ENT)
+    tab2 = _Nada(seccion == ET_SAL)
+    tab3 = _Nada(seccion == ET_HIS)
+    tab4 = _Nada(seccion == ET_AUS) if admin else None
 
     # Filtrar empleados según rol
     if not admin and usuario:
@@ -1250,7 +1275,7 @@ def page_asistencia():
         return {f"{r['ID_Empleado']} – {r['Nombre']}": (str(r["ID_Empleado"]), str(r["Nombre"]))
                 for _, r in df.iterrows()}
 
-    with tab1:
+    if tab1.activo:
         st.subheader(f"Registrar entrada – {hoy().strftime('%d/%m/%Y')}")
         opciones = emp_opciones(df_emp_fil)
         if not opciones:
@@ -1270,13 +1295,25 @@ def page_asistencia():
                 st.info(f"🕐 Hora actual en Ecuador: **{ahora().strftime('%H:%M')}**")
                 st.caption("La hora se toma automáticamente al registrar y no se "
                            "puede modificar.")
-                if not dentro_de_ventana_entrada(ahora(), config):
+                # Fuera del horario, una entrada equivale a horas de atraso en
+                # el expediente. No puede quedar a un clic de distancia de
+                # alguien que entró aquí buscando marcar su salida.
+                fuera = not dentro_de_ventana_entrada(ahora(), config)
+                confirmado = True
+                if fuera:
                     _d, _h = ventana_registro_entrada(config)
+                    _atraso = sm.minutos_de_atraso(ahora().strftime("%H:%M"), config)
                     st.warning(f"⚠️ Son las {ahora().strftime('%H:%M')}, fuera del "
                                f"horario laboral ({_d.strftime('%H:%M')}–{_h.strftime('%H:%M')}). "
-                               "Registrar la entrada ahora dejaría un atraso enorme en "
-                               "el expediente. Verifica que sea lo que quieres.")
-                if st.button("📌 Registrar mi entrada ahora", type="primary"):
+                               f"Registrar la entrada ahora quedaría como "
+                               f"**{_atraso} minuto(s) de atraso** en tu expediente.")
+                    st.info("¿Venías a marcar tu **salida**? Cambia a la sección "
+                            "«⬇️ Registrar salida» de arriba.")
+                    confirmado = st.checkbox(
+                        "Entiendo el atraso que esto genera y quiero registrar mi "
+                        "entrada de todos modos", key="conf_entrada_fuera")
+                if st.button("📌 Registrar mi entrada ahora", type="primary",
+                             disabled=not confirmado):
                     momento = ahora()
                     with st.spinner("Registrando…"):
                         estado, atraso = sm.registrar_entrada(
@@ -1291,7 +1328,7 @@ def page_asistencia():
                                          f"a las {momento.strftime('%H:%M')}.")
                     st.rerun()
 
-    with tab2:
+    if tab2.activo:
         st.subheader(f"Registrar salida – {hoy().strftime('%d/%m/%Y')}")
         opciones = emp_opciones(df_emp_fil)
         if not opciones:
@@ -1318,8 +1355,12 @@ def page_asistencia():
                     with st.spinner("Registrando…"):
                         ev = sm.registrar_salida(emp_id, hoy_str,
                                                  momento.strftime("%H:%M"), obs, config)
+                    # Explícito: la sección se conserva para que nadie lea la
+                    # recarga como si le hubieran registrado una entrada.
+                    st.session_state["sec_asistencia"] = ET_SAL
                     flash("success", f"✅ Salida de **{nombre}** registrada a las "
-                                     f"{momento.strftime('%H:%M')}.")
+                                     f"{momento.strftime('%H:%M')}. Tu jornada de hoy "
+                                     f"quedó cerrada.")
                     if ev["anticipada"]:
                         flash("warning", f"⏱️ Salida **{ev['minutos_antes']} minuto(s) "
                                          f"antes** del horario ({ev['horario_fin']}). "
@@ -1349,7 +1390,7 @@ def page_asistencia():
                 with st.spinner("Revisando…"):
                     revisar_salidas_pendientes(sm, config, int(dias_rev), mostrar=True)
 
-    with tab3:
+    if tab3.activo:
         st.subheader("Historial de asistencia")
         c1, c2 = st.columns(2)
         with c1:
@@ -1387,8 +1428,8 @@ def page_asistencia():
         else:
             sin_datos("No hay registros de asistencia.", "info")
 
-    if tab4:
-        with tab4:
+    if tab4 is not None and tab4.activo:
+        if True:
             st.subheader("Marcar ausencia")
             opciones = emp_opciones(df_emp)
             if not opciones:

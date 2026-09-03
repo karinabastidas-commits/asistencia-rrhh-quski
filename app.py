@@ -12,6 +12,7 @@ import html as _html
 from sheets_manager import (
     SheetsManager, CONFIG_DEFAULTS, ahora_local, hoy_local,
     EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO, TIPO_TARDANZA,
+    CAUSALES_LLAMADO, GRAVEDAD_CAUSAL, TIPOS_RECONOCIMIENTO,
     password_debil,
 )
 
@@ -131,6 +132,10 @@ def notificar_tardanza(sm, config, emp_id, nombre, momento, atraso):
         atrasos_mes = sm.get_tardanzas_mes(emp_id, mes)
     except Exception:
         atrasos_mes = 0
+    # Google Sheets tarda un instante en reflejar la fila recién escrita, así
+    # que el conteo puede volver sin incluir este mismo atraso: nunca puede ser
+    # menos de 1, porque lo acabamos de registrar.
+    atrasos_mes = max(1, atrasos_mes)
 
     llamado_id = ""
     try:
@@ -180,6 +185,31 @@ def notificar_tardanza(sm, config, emp_id, nombre, momento, atraso):
         flash("warning", "⚠️ " + alerta)
 
 
+def ventana_registro_entrada(config):
+    """Rango horario en el que tiene sentido registrar una entrada.
+
+    Va desde unas horas antes del horario de inicio hasta el horario de salida.
+    Fuera de ese rango NO se marca entrada automática: quien abre el sistema a
+    las nueve de la noche para revisar sus vacaciones o marcar su salida no
+    está llegando al trabajo, y registrarle una entrada con 700 minutos de
+    atraso inventa un dato falso en el expediente.
+    """
+    margen = _cfg_int(config, "Margen_Registro_Entrada_Horas", 3)
+    try:
+        ini = datetime.strptime(str(config.get("Horario_Inicio", "09:00"))[:5], "%H:%M")
+        fin = datetime.strptime(str(config.get("Horario_Fin", "17:30"))[:5], "%H:%M")
+    except ValueError:
+        return None, None
+    return (ini - timedelta(hours=margen)).time(), fin.time()
+
+
+def dentro_de_ventana_entrada(momento, config) -> bool:
+    desde, hasta = ventana_registro_entrada(config)
+    if desde is None:
+        return True
+    return desde <= momento.time() <= hasta
+
+
 def registrar_entrada_automatica():
     """Marca la entrada del empleado al iniciar sesión, una sola vez al día.
 
@@ -205,13 +235,29 @@ def registrar_entrada_automatica():
         return   # sin ficha de empleado no hay a quién registrarle la asistencia
 
     fecha_hoy = hoy().strftime("%Y-%m-%d")
+    momento = ahora()
+    config = st.session_state.config
+
+    # Fuera del horario laboral no se inventa una entrada.
+    if not dentro_de_ventana_entrada(momento, config):
+        try:
+            ya = sm.ya_registro_entrada(emp_id, fecha_hoy)
+        except Exception:
+            ya = True
+        if not ya:
+            desde, hasta = ventana_registro_entrada(config)
+            flash("info", f"ℹ️ No se registró entrada automática porque son las "
+                          f"{momento.strftime('%H:%M')}, fuera del horario laboral "
+                          f"({desde.strftime('%H:%M')}–{hasta.strftime('%H:%M')}). "
+                          "Si hoy trabajaste y falta tu marca, pídele a RRHH que la registre.")
+        return
+
     try:
         if sm.ya_registro_entrada(emp_id, fecha_hoy):
             return
-        momento = ahora()
         estado, atraso = sm.registrar_entrada(
             emp_id, str(emp.get("Nombre", emp_id)),
-            momento.strftime("%H:%M"), st.session_state.config)
+            momento.strftime("%H:%M"), config)
         if estado == "Tardanza":
             flash("warning", f"⏰ Tu entrada quedó registrada a las "
                              f"{momento.strftime('%H:%M')} — {atraso} minuto(s) de atraso.")
@@ -453,6 +499,7 @@ def init_session():
                 # aprobación si la hoja viene de una versión anterior. Es
                 # idempotente y debe correr ANTES de escribir cualquier solicitud.
                 sm.migrar_esquema()
+                sm.ensure_hojas_riesgo()
                 st.session_state.sm = sm
                 st.session_state.config = sm.get_config()
         except Exception as e:
@@ -582,6 +629,7 @@ def conectar_sheets(creds_dict: dict):
         sm.ensure_usuarios_sheet()
         sm.ensure_llamados_sheet()
         sm.migrar_esquema()
+        sm.ensure_hojas_riesgo()
         st.session_state.sm = sm
         st.session_state.config = sm.get_config()
         return True
@@ -805,6 +853,7 @@ def sidebar():
                 "⚙️  Configuración",
                 "🔐  Gestión Usuarios",
                 "🏖️  Saldo Vacaciones",
+                "🛡️  Riesgo Operativo",
                 "⚠️  Llamados de Atención",
                 "📁  Expediente",
             ]
@@ -813,6 +862,7 @@ def sidebar():
             # Quien tiene personal a cargo ve primero su bandeja de aprobaciones
             if es_jefe():
                 options.append("✍️  Aprobaciones")
+                options.append("⚠️  Llamados de Atención")
             options += [
                 "📋  Mis Permisos",
                 "🏖️  Mis Vacaciones",
@@ -1106,6 +1156,12 @@ def page_asistencia():
                 st.info(f"🕐 Hora actual en Ecuador: **{ahora().strftime('%H:%M')}**")
                 st.caption("La hora se toma automáticamente al registrar y no se "
                            "puede modificar.")
+                if not dentro_de_ventana_entrada(ahora(), config):
+                    _d, _h = ventana_registro_entrada(config)
+                    st.warning(f"⚠️ Son las {ahora().strftime('%H:%M')}, fuera del "
+                               f"horario laboral ({_d.strftime('%H:%M')}–{_h.strftime('%H:%M')}). "
+                               "Registrar la entrada ahora dejaría un atraso enorme en "
+                               "el expediente. Verifica que sea lo que quieres.")
                 if st.button("📌 Registrar mi entrada ahora", type="primary"):
                     momento = ahora()
                     with st.spinner("Registrando…"):
@@ -1155,6 +1211,13 @@ def page_asistencia():
                                          f"antes** del horario ({ev['horario_fin']}). "
                                          "Se avisó a tu jefe inmediato.")
                         notificar_salida_anticipada(sm, config, emp_id, nombre, ev, obs)
+                    elif ev.get("permiso") and ev["minutos_antes"] > 0:
+                        # Salió antes pero tenía permiso: no es salida anticipada.
+                        pm = ev["permiso"]
+                        flash("info", f"ℹ️ Saliste {ev['minutos_antes']} minuto(s) antes, "
+                                      f"amparado por el permiso **{pm['id']}** "
+                                      f"({pm['horas']}h). No se registró como salida "
+                                      "anticipada ni se avisó a tu jefe.")
                     st.rerun()
                 except ValueError as e:
                     st.error(str(e))
@@ -1295,6 +1358,40 @@ def page_configuracion():
             tard_suspension = st.number_input("Suspensión", min_value=1, max_value=30,
                 value=_cfg_int(config, "Tardanzas_Suspension", 8))
 
+        st.subheader("🛡️ Riesgo operativo – pesos del modelo")
+        st.caption("Cuánto pesa cada factor en el puntaje de riesgo. Se normalizan a "
+                   "100, así que poner uno en cero lo elimina y redistribuye el resto.")
+        w1, w2, w3 = st.columns(3)
+        with w1:
+            w_buro = st.number_input("Score de buró", 0, 100,
+                _cfg_int(config, "Riesgo_Peso_Buro", 30))
+            w_pep = st.number_input("Condición PEP", 0, 100,
+                _cfg_int(config, "Riesgo_Peso_PEP", 10))
+        with w2:
+            w_doc = st.number_input("Documentación KYE", 0, 100,
+                _cfg_int(config, "Riesgo_Peso_Documentos", 15))
+            w_fam = st.number_input("Situación familiar", 0, 100,
+                _cfg_int(config, "Riesgo_Peso_Familiar", 10),
+                help="Estado civil, hijos y situación del cónyuge. Ponerlo en cero "
+                     "elimina ese factor del cálculo.")
+        with w3:
+            w_dis = st.number_input("Historial disciplinario", 0, 100,
+                _cfg_int(config, "Riesgo_Peso_Disciplina", 25))
+            w_ant = st.number_input("Antigüedad", 0, 100,
+                _cfg_int(config, "Riesgo_Peso_Antiguedad", 10))
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            buro_bueno = st.number_input("Score de buró considerado bueno", 0, 1000,
+                _cfg_int(config, "Buro_Score_Bueno", 800))
+        with b2:
+            buro_malo = st.number_input("Score de buró considerado deficiente", 0, 1000,
+                _cfg_int(config, "Buro_Score_Malo", 400))
+        with b3:
+            st.caption("Umbrales de nivel sobre el puntaje 0-100")
+            u_med = st.number_input("Medio desde", 0, 100, _cfg_int(config, "Riesgo_Umbral_Medio", 30))
+            u_alt = st.number_input("Alto desde", 0, 100, _cfg_int(config, "Riesgo_Umbral_Alto", 55))
+            u_cri = st.number_input("Crítico desde", 0, 100, _cfg_int(config, "Riesgo_Umbral_Critico", 75))
+
         st.subheader("🏖️ Vacaciones")
         st.caption("Días **calendario** (incluyen fines de semana), no días hábiles.")
         v1, v2, v3 = st.columns(3)
@@ -1325,6 +1422,17 @@ def page_configuracion():
                 "Dias_Vacaciones_Base":        str(vac_base),
                 "Anio_Inicio_Dia_Adicional":   str(vac_desde),
                 "Max_Dias_Vacaciones":         str(vac_techo),
+                "Riesgo_Peso_Buro":            str(w_buro),
+                "Riesgo_Peso_PEP":             str(w_pep),
+                "Riesgo_Peso_Documentos":      str(w_doc),
+                "Riesgo_Peso_Familiar":        str(w_fam),
+                "Riesgo_Peso_Disciplina":      str(w_dis),
+                "Riesgo_Peso_Antiguedad":      str(w_ant),
+                "Buro_Score_Bueno":            str(buro_bueno),
+                "Buro_Score_Malo":             str(buro_malo),
+                "Riesgo_Umbral_Medio":         str(u_med),
+                "Riesgo_Umbral_Alto":          str(u_alt),
+                "Riesgo_Umbral_Critico":       str(u_cri),
             }
             with st.spinner("Guardando…"):
                 try:
@@ -2327,6 +2435,354 @@ def _page_horas_extras_con_rol():
                             st.error("Ingresa quién aprueba.")
 
 
+# ── Módulo: Riesgo Operativo y KYE ───────────────────────────────────────────
+_SI_NO = ["No", "Si"]
+
+
+def _chk(valor) -> int:
+    return 1 if str(valor).strip().lower() in ("si", "sí", "true", "1", "x") else 0
+
+
+def panel_riesgo(sm, config, emp_id, compacto: bool = False):
+    """Muestra la evaluación de riesgo de un asesor con su desglose."""
+    ev = sm.evaluar_riesgo(emp_id, config)
+
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        st.metric("Riesgo operativo", f"{ev['puntaje']:.0f}/100",
+                  help="0 = sin riesgo · 100 = riesgo máximo")
+        st.markdown(f"### {ev['icono']} {ev['nivel']}")
+    with c2:
+        if not ev["tiene_kye"]:
+            st.warning("⚠️ Sin ficha **Conozca a su Empleado**. Los factores de "
+                       "documentación y situación familiar se calculan en el peor "
+                       "escenario hasta que se llene.")
+        top = sorted(ev["desglose"], key=lambda d: -d["Aporta al puntaje"])[:2]
+        if top and top[0]["Aporta al puntaje"] > 0:
+            st.markdown("**Lo que más pesa:**")
+            for d in top:
+                if d["Aporta al puntaje"] > 0:
+                    st.markdown(f"- {d['Factor']} (+{d['Aporta al puntaje']}) — {d['Por qué']}")
+
+    if not compacto:
+        with st.expander("🔍 Desglose completo del cálculo", expanded=False):
+            st.dataframe(pd.DataFrame(ev["desglose"]), use_container_width=True,
+                         hide_index=True)
+            st.caption(f"Los pesos suman {ev['peso_total']:.0f} y el puntaje se "
+                       "normaliza a 100. Se ajustan en Configuración.")
+    return ev
+
+
+def page_riesgo_operativo():
+    sm = get_sm()
+    config = st.session_state.config
+    usuario = get_usuario()
+    st.title("🛡️ Riesgo Operativo")
+
+    et_mat = "📊 Matriz por asesor"
+    et_kye = "📋 Ficha Conozca a su Empleado"
+    et_bur = "📈 Score de buró"
+    et_rec = "🎖️ Reconocimientos"
+    seccion = secciones([et_mat, et_kye, et_bur, et_rec], "sec_riesgo")
+    st.divider()
+
+    df_emp = sm.get_empleados()
+    if df_emp.empty:
+        st.warning("No hay empleados registrados.")
+        return
+    opciones = {f"{r['ID_Empleado']} – {r['Nombre']}": str(r["ID_Empleado"])
+                for _, r in df_emp.iterrows() if str(r["ID_Empleado"]).strip()}
+
+    # ── Matriz ───────────────────────────────────────────────────────────────
+    if seccion == et_mat:
+        with st.spinner("Evaluando al personal…"):
+            matriz = sm.matriz_riesgo(config)
+        if matriz.empty:
+            st.info("Sin empleados para evaluar.")
+            return
+
+        c1, c2, c3, c4 = st.columns(4)
+        for col, nivel, etiqueta in ((c1, "Crítico", "🔴 Crítico"), (c2, "Alto", "🟠 Alto"),
+                                     (c3, "Medio", "🟡 Medio"), (c4, "Bajo", "🟢 Bajo")):
+            col.metric(etiqueta, int(matriz["Nivel"].str.contains(nivel).sum()))
+
+        criticos = matriz[matriz["Nivel"].str.contains("Crítico|Alto")]
+        if not criticos.empty:
+            st.error(f"⚠️ **{len(criticos)}** asesor(es) en riesgo alto o crítico. "
+                     "Requieren revisión de controles.")
+
+        sin_kye = matriz[matriz["Ficha KYE"] == "Falta"]
+        if not sin_kye.empty:
+            st.warning(f"📋 **{len(sin_kye)}** sin ficha KYE: "
+                       + ", ".join(sin_kye["Nombre"].astype(str).tolist()))
+
+        st.dataframe(matriz, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ Descargar matriz en CSV",
+                           matriz.to_csv(index=False).encode("utf-8"),
+                           file_name=f"matriz_riesgo_{hoy().strftime('%Y%m%d')}.csv",
+                           mime="text/csv")
+
+        st.divider()
+        st.subheader("Detalle por asesor")
+        sel = st.selectbox("Asesor", list(opciones.keys()), key="riesgo_detalle")
+        panel_riesgo(sm, config, opciones[sel])
+
+    # ── Ficha KYE ────────────────────────────────────────────────────────────
+    elif seccion == et_kye:
+        st.caption("Datos del formulario de vinculación. Alimentan los factores de "
+                   "documentación, condición PEP y situación familiar de la matriz.")
+        sel = st.selectbox("Empleado", list(opciones.keys()), key="kye_emp")
+        emp_id = opciones[sel]
+        k = sm.get_kye(emp_id)
+        if k:
+            st.success(f"✅ Ficha registrada · última actualización: "
+                       f"{k.get('Actualizado', '—')}")
+        else:
+            st.info("Este empleado todavía no tiene ficha. Complétala abajo.")
+
+        with st.form("form_kye"):
+            st.markdown("##### I. Información personal")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                cedula = st.text_input("Cédula / Pasaporte", k.get("Cedula", ""))
+                nacion = st.text_input("Nacionalidad", k.get("Nacionalidad", "Ecuatoriana"))
+            with c2:
+                f_nac = st.text_input("Fecha de nacimiento (AAAA-MM-DD)",
+                                      k.get("Fecha_Nacimiento", ""))
+                ciudad = st.text_input("Ciudad de nacimiento", k.get("Ciudad_Nacimiento", ""))
+            with c3:
+                civiles = ["Soltero(a)", "Casado(a)", "Divorciado(a)", "Viudo(a)",
+                           "Separado(a)", "Unión libre"]
+                ec = k.get("Estado_Civil", "")
+                civil = st.selectbox("Estado civil", civiles,
+                                     index=civiles.index(ec) if ec in civiles else 0)
+                sexos = ["Femenino", "Masculino"]
+                sx = k.get("Sexo", "")
+                sexo = st.selectbox("Sexo", sexos, index=sexos.index(sx) if sx in sexos else 0)
+            hijos = st.number_input("Número de hijos", min_value=0, max_value=20,
+                                    value=int(sm._a_numero(k.get("Num_Hijos"), 0)))
+
+            st.markdown("##### II. Residencia y contacto")
+            r1, r2, r3 = st.columns(3)
+            with r1:
+                provincia = st.text_input("Provincia", k.get("Provincia", ""))
+                canton    = st.text_input("Cantón", k.get("Canton", ""))
+            with r2:
+                parroquia = st.text_input("Parroquia", k.get("Parroquia", ""))
+                direccion = st.text_input("Dirección", k.get("Direccion", ""))
+            with r3:
+                tel_dom = st.text_input("Teléfono domicilio", k.get("Telefono_Domicilio", ""))
+                celular = st.text_input("Celular", k.get("Celular", ""))
+            email_p = st.text_input("Correo personal", k.get("Email_Personal", ""))
+
+            st.markdown("##### III–IV. Cónyuge y su actividad económica")
+            y1, y2, y3 = st.columns(3)
+            with y1:
+                cy_nom = st.text_input("Nombre del cónyuge", k.get("Conyuge_Nombre", ""),
+                                       help="Déjalo vacío si no aplica.")
+                cy_ced = st.text_input("Cédula del cónyuge", k.get("Conyuge_Cedula", ""))
+            with y2:
+                cy_trab = st.selectbox("¿El cónyuge tiene ingresos propios?", _SI_NO,
+                                       index=_chk(k.get("Conyuge_Trabaja")))
+                cy_rel  = st.selectbox("Relación laboral",
+                                       ["", "Empleado público", "Empleado privado", "Independiente"],
+                                       index=["", "Empleado público", "Empleado privado",
+                                              "Independiente"].index(k.get("Conyuge_Relacion", ""))
+                                       if k.get("Conyuge_Relacion", "") in
+                                       ["", "Empleado público", "Empleado privado", "Independiente"] else 0)
+            with y3:
+                cy_emp  = st.text_input("Empresa / negocio", k.get("Conyuge_Empresa", ""))
+                cy_carg = st.text_input("Cargo", k.get("Conyuge_Cargo", ""))
+            cy_act = st.text_input("Actividad económica", k.get("Conyuge_Actividad", ""))
+
+            st.markdown("##### V. Declaración de Persona Expuesta Políticamente")
+            p1, p2 = st.columns(2)
+            with p1:
+                es_pep = st.selectbox("¿Es o fue PEP en los últimos 3 años?", _SI_NO,
+                                      index=_chk(k.get("Es_PEP")))
+                pep_cargo = st.text_input("Cargo desempeñado", k.get("PEP_Cargo", ""))
+            with p2:
+                fam_pep = st.selectbox("¿Tiene familiar o vínculo cercano PEP?", _SI_NO,
+                                       index=_chk(k.get("Familiar_PEP")))
+                fam_det = st.text_input("Nombre, cargo y parentesco",
+                                        k.get("Familiar_PEP_Detalle", ""))
+
+            st.markdown("##### Otros ingresos")
+            o1, o2 = st.columns(2)
+            with o1:
+                otros = st.selectbox("¿Declara otros ingresos?", _SI_NO,
+                                     index=_chk(k.get("Otros_Ingresos")))
+            with o2:
+                otros_det = st.text_input("Detalle", k.get("Otros_Ingresos_Detalle", ""))
+
+            st.markdown("##### Documentos adjuntos y validaciones")
+            etiquetas = {
+                "Doc_Hoja_Vida": "a) Hoja de vida",
+                "Doc_Cedula": "b) Copia de cédula",
+                "Doc_Cedula_Conyuge": "c) Cédula del cónyuge",
+                "Doc_Papeleta": "d) Papeleta de votación",
+                "Doc_Papeleta_Conyuge": "e) Papeleta del cónyuge",
+                "Doc_Ref_Laborales": "f) 3 referencias laborales",
+                "Doc_Ref_Personales": "g) 3 referencias personales",
+                "Doc_Servicio_Basico": "h) Planilla de servicio básico",
+                "Doc_Declaracion_Patrimonial": "i) Declaración patrimonial",
+            }
+            docs, cols_d = {}, st.columns(3)
+            for i, (campo, etiqueta) in enumerate(etiquetas.items()):
+                with cols_d[i % 3]:
+                    docs[campo] = "Si" if st.checkbox(
+                        etiqueta, value=bool(_chk(k.get(campo))), key=f"kye_{campo}") else "No"
+
+            f_form = st.text_input("Fecha del formulario (AAAA-MM-DD)",
+                                   k.get("Fecha_Formulario", hoy().strftime("%Y-%m-%d")))
+            obs = st.text_area("Observaciones", k.get("Observaciones", ""))
+
+            if st.form_submit_button("💾 Guardar ficha KYE", type="primary"):
+                datos = {
+                    "Cedula": cedula, "Fecha_Nacimiento": f_nac, "Nacionalidad": nacion,
+                    "Ciudad_Nacimiento": ciudad, "Estado_Civil": civil, "Sexo": sexo,
+                    "Num_Hijos": hijos, "Provincia": provincia, "Canton": canton,
+                    "Parroquia": parroquia, "Direccion": direccion,
+                    "Telefono_Domicilio": tel_dom, "Celular": celular,
+                    "Email_Personal": email_p,
+                    "Conyuge_Nombre": cy_nom, "Conyuge_Cedula": cy_ced,
+                    "Conyuge_Trabaja": cy_trab, "Conyuge_Relacion": cy_rel,
+                    "Conyuge_Empresa": cy_emp, "Conyuge_Actividad": cy_act,
+                    "Conyuge_Cargo": cy_carg,
+                    "Es_PEP": es_pep, "PEP_Cargo": pep_cargo,
+                    "Familiar_PEP": fam_pep, "Familiar_PEP_Detalle": fam_det,
+                    "Otros_Ingresos": otros, "Otros_Ingresos_Detalle": otros_det,
+                    "Fecha_Formulario": f_form, "Observaciones": obs,
+                    "Registrado_Por": str(usuario.get("nombre", "")) if usuario else "",
+                    **docs,
+                }
+                try:
+                    with st.spinner("Guardando…"):
+                        sm.guardar_kye(emp_id, datos)
+                    flash("success", f"✅ Ficha KYE de **{sel}** guardada.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ No se pudo guardar: {e}")
+
+    # ── Score de buró ────────────────────────────────────────────────────────
+    elif seccion == et_bur:
+        st.caption("Score al ingreso y en cada revisión. Un deterioro frente al "
+                   "score de ingreso aumenta el riesgo del asesor.")
+        sel = st.selectbox("Empleado", list(opciones.keys()), key="buro_emp")
+        emp_id = opciones[sel]
+
+        actual = sm.score_buro_actual(emp_id)
+        if actual:
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Score actual", f"{actual['actual']:.0f}")
+            b2.metric("Al ingreso", f"{actual['ingreso']:.0f}" if actual["ingreso"] else "—",
+                      delta=(f"{actual['actual'] - actual['ingreso']:+.0f}"
+                             if actual["ingreso"] else None))
+            b3.metric("Revisiones", actual["revisiones"])
+        else:
+            st.info("Sin score registrado para este empleado.")
+
+        with st.form("form_buro", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                score = st.number_input("Score", min_value=0, max_value=1000, value=700,
+                                        help="Mayor score = mejor comportamiento crediticio.")
+            with c2:
+                tipo_b = st.selectbox("Tipo", ["Ingreso", "Revisión anual",
+                                               "Revisión semestral", "Revisión extraordinaria"])
+            with c3:
+                fuente = st.text_input("Fuente", "Equifax")
+            fecha_b = st.date_input("Fecha de consulta", hoy(), max_value=hoy())
+            obs_b = st.text_area("Observaciones")
+            if st.form_submit_button("💾 Registrar score", type="primary"):
+                try:
+                    with st.spinner("Guardando…"):
+                        bid = sm.registrar_score_buro(
+                            emp_id, score, tipo_b, fuente,
+                            str(usuario.get("nombre", "")) if usuario else "",
+                            obs_b, fecha_b.strftime("%Y-%m-%d"))
+                    flash("success", f"✅ Score **{bid}** registrado para {sel}.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ No se pudo registrar: {e}")
+
+        h = sm.historial_buro(emp_id)
+        if not h.empty:
+            st.divider()
+            st.subheader("Historial")
+            st.dataframe(h[[c for c in ("Fecha", "Score", "Tipo", "Fuente",
+                                        "Observaciones", "Registrado_Por")
+                            if c in h.columns]],
+                         use_container_width=True, hide_index=True)
+            serie = h.copy()
+            serie["Score"] = pd.to_numeric(serie["Score"], errors="coerce")
+            serie = serie.dropna(subset=["Score"])
+            if len(serie) > 1:
+                st.line_chart(serie.set_index("Fecha")["Score"])
+
+    # ── Reconocimientos ──────────────────────────────────────────────────────
+    else:
+        st.caption("Cartas de felicitación y reconocimientos. Compensan parcialmente "
+                   "el historial disciplinario en la matriz de riesgo.")
+        sel = st.selectbox("Empleado", list(opciones.keys()), key="rec_emp")
+        emp_id = opciones[sel]
+        nombre_emp = sel.split(" – ")[-1]
+
+        with st.form("form_reconocimiento", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                tipo_r = st.selectbox("Tipo de reconocimiento", TIPOS_RECONOCIMIENTO)
+            with c2:
+                fecha_r = st.date_input("Fecha", hoy(), max_value=hoy())
+            motivo_r = st.text_area("Motivo *",
+                                    placeholder="Ej: Cero diferencias en cierre de caja "
+                                                "durante doce meses consecutivos.")
+            otorga = st.text_input("Otorgado por *",
+                                   value=str(usuario.get("nombre", "")) if usuario else "")
+            if st.form_submit_button("🎖️ Registrar reconocimiento", type="primary"):
+                if not motivo_r.strip():
+                    st.error("El motivo es obligatorio.")
+                elif not otorga.strip():
+                    st.error("Indica quién lo otorga.")
+                else:
+                    try:
+                        with st.spinner("Guardando…"):
+                            rid = sm.registrar_reconocimiento(
+                                emp_id, nombre_emp, tipo_r, motivo_r.strip(),
+                                otorga.strip(), fecha_r.strftime("%Y-%m-%d"))
+                        flash("success", f"🎖️ Reconocimiento **{rid}** registrado "
+                                         f"para {nombre_emp}.")
+                        email_emp = sm.get_email_empleado(emp_id)
+                        cuerpo = (f"<p>Estimado/a <strong>{esc(nombre_emp)}</strong>,</p>"
+                                  f"<p>Se ha registrado un "
+                                  f"<strong style='color:#065F46'>{esc(tipo_r)}</strong> "
+                                  f"en tu expediente.</p>"
+                                  + tabla_html([("Tipo", tipo_r),
+                                                ("Motivo", motivo_r.strip()),
+                                                ("Otorgado por", otorga.strip()),
+                                                ("Fecha", fecha_r.strftime("%d/%m/%Y"))])
+                                  + "<p style='margin-top:16px'>¡Felicitaciones!</p>")
+                        env, fal = notificar([email_emp, sm.get_email_jefe(emp_id),
+                                              config.get("Email_RRHH", "")],
+                                             f"Reconocimiento – {nombre_emp}", cuerpo)
+                        if env:
+                            flash("info", "📧 Notificado a: " + ", ".join(env))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ No se pudo registrar: {e}")
+
+        rec = sm.get_reconocimientos(emp_id)
+        if not rec.empty:
+            st.divider()
+            st.subheader(f"Reconocimientos de {nombre_emp}")
+            st.dataframe(rec[[c for c in ("ID_Reconocimiento", "Fecha", "Tipo",
+                                          "Motivo", "Otorgado_Por")
+                              if c in rec.columns]],
+                         use_container_width=True, hide_index=True)
+        else:
+            st.info("Sin reconocimientos registrados para esta persona.")
+
+
 # ── Módulo: Expediente del Empleado (solo admin) ─────────────────────────────
 def page_expediente_empleado():
     sm = get_sm()
@@ -2518,12 +2974,22 @@ def page_expediente_empleado():
 # ── Módulo: Llamados de Atención (solo admin) ─────────────────────────────────
 def page_llamados_atencion():
     sm = get_sm()
+    admin = es_admin()
+    usuario = get_usuario()
     st.title("⚠️ Llamados de Atención")
 
+    # RRHH y auditoría ven a toda la empresa; un jefe de área solo a su equipo.
+    if not admin:
+        correo = email_usuario_actual()
+        st.caption("Como jefe de área puedes emitir llamados sobre las personas a "
+                   "tu cargo. El registro queda a tu nombre.")
     tab1, tab2, tab3 = st.tabs(["📊 Monitor de Atrasos", "➕ Emitir Llamado", "📋 Historial"])
 
     mes_actual = hoy().strftime("%Y-%m")
-    df_emp  = sm.get_empleados()
+    df_emp  = sm.get_empleados() if admin else sm.get_subordinados(email_usuario_actual())
+    if df_emp.empty and not admin:
+        st.info("No hay empleados asignados a tu cargo.")
+        return
     df_asis = sm.get_df("Asistencia")
     df_llamados = sm.get_llamados_atencion()
 
@@ -2591,20 +3057,37 @@ def page_llamados_atencion():
             else:
                 st.caption(f"Tardanzas este mes: **{atrasos_mes}** (por debajo del umbral de {t_verbal})")
 
+            # La causal se elige fuera del formulario para poder sugerir la
+            # gravedad en cuanto cambia, sin esperar al envío.
+            causal = st.selectbox("Causal del llamado *", CAUSALES_LLAMADO,
+                                  key="causal_llamado",
+                                  help="Determina la gravedad sugerida y permite "
+                                       "analizar después qué falla más en la operación.")
+            tipo_por_causal = GRAVEDAD_CAUSAL.get(causal, "Verbal")
+            escala = ["Verbal", "Escrito", "Suspensión"]
+            # Manda la más grave entre la sugerida por tardanzas y la de la causal
+            sugerido = escala[max(escala.index(tipo_sug), escala.index(tipo_por_causal))]
+            if causal != "Acumulación de tardanzas":
+                st.caption(f"Para **{causal}** la gravedad sugerida es "
+                           f"**{tipo_por_causal}**. Puedes cambiarla abajo.")
+
             with st.form("form_llamado", clear_on_submit=True):
                 emp_id = emp_id_la
-                idx_tipo = ["Verbal", "Escrito", "Suspensión"].index(tipo_sug)
-                tipo = st.selectbox("Tipo de llamado", ["Verbal", "Escrito", "Suspensión"],
-                                    index=idx_tipo,
+                tipo = st.selectbox("Tipo de llamado", escala,
+                                    index=escala.index(sugerido),
                                     help="Verbal: primer aviso oral | Escrito: queda en el expediente | Suspensión: sin goce de sueldo")
-                motivo = st.text_area("Motivo del llamado de atención *",
-                                      placeholder="Ej: Acumulación de tardanzas reiteradas durante el mes")
-                registrado_por = st.text_input("Emitido por (nombre o cargo) *",
-                                               placeholder="Ej: Karina Bastidas – Jefe RRHH")
+                motivo = st.text_area("Detalle del hecho *",
+                                      placeholder="Ej: Tasación de la prenda 4471 con avalúo 35% "
+                                                  "sobre el valor de mercado, sin sustento en el sistema.",
+                                      help="Describe el hecho concreto: fecha, operación, monto, "
+                                           "cliente. Es lo que sostiene el llamado si se impugna.")
+                registrado_por = st.text_input("Emitido por (nombre y cargo) *",
+                                               value=str(usuario.get("nombre", "")) if usuario else "",
+                                               placeholder="Ej: Karina Bastidas – Auditoría y Control Interno")
 
                 if st.form_submit_button("📋 Emitir llamado de atención", type="primary"):
                     if not motivo.strip():
-                        st.error("El motivo es obligatorio.")
+                        st.error("El detalle del hecho es obligatorio.")
                     elif not registrado_por.strip():
                         st.error("Ingresa quién emite el llamado.")
                     else:
@@ -2613,7 +3096,8 @@ def page_llamados_atencion():
                             nombre_emp = emp_row.iloc[0]["Nombre"] if not emp_row.empty else emp_id
                             email_emp  = emp_row.iloc[0].get("Email", "") if not emp_row.empty else ""
                             llamado_id = sm.registrar_llamado_atencion(
-                                emp_id, nombre_emp, tipo, motivo, atrasos_mes, registrado_por
+                                emp_id, nombre_emp, tipo,
+                                f"[{causal}] {motivo}", atrasos_mes, registrado_por
                             )
                         st.success(f"✅ Llamado **{llamado_id}** ({tipo}) emitido para **{nombre_emp}**")
 
@@ -2621,6 +3105,7 @@ def page_llamados_atencion():
                         email_jefe = sm.get_email_jefe(emp_id)
                         email_rrhh = st.session_state.config.get("Email_RRHH", "")
                         detalle_la = [("Empleado", f"{emp_id} – {nombre_emp}"),
+                                      ("Causal", causal),
                                       ("Tipo de llamado", tipo),
                                       ("Motivo", motivo),
                                       ("Tardanzas acumuladas en el mes", atrasos_mes),
@@ -2749,6 +3234,7 @@ def main():
             "Configuración":     page_configuracion,
             "Gestión Usuarios":     page_gestion_usuarios,
             "Saldo Vacaciones":     page_saldo_vacaciones,
+            "Riesgo Operativo":     page_riesgo_operativo,
             "Llamados de Atención": page_llamados_atencion,
             "Expediente":           page_expediente_empleado,
         }
@@ -2756,6 +3242,7 @@ def main():
         pages = {
             "Mi Asistencia":     page_asistencia,
             "Aprobaciones":      page_aprobaciones_jefe,
+            "Llamados de Atención": page_llamados_atencion,
             "Mis Permisos":      _page_permisos_con_rol,
             "Mis Vacaciones":    _page_vacaciones_con_rol,
             "Mis Horas Extra":   _page_horas_extras_con_rol,

@@ -72,7 +72,35 @@ HEADERS = {
     "Usuarios":          ["ID_Empleado", "Password_Hash", "Rol"],
     "Llamados_Atencion": ["ID_Llamado", "Fecha", "ID_Empleado", "Nombre", "Tipo", "Motivo",
                           "Atrasos_Acumulados", "Registrado_Por", "Estado"],
+    # Formulario "Conozca a su Empleado" (KYE) — base de la matriz de riesgo
+    "KYE_Empleado": ["ID_Empleado", "Cedula", "Fecha_Nacimiento", "Nacionalidad",
+                     "Ciudad_Nacimiento", "Estado_Civil", "Sexo", "Num_Hijos",
+                     "Provincia", "Canton", "Parroquia", "Direccion",
+                     "Telefono_Domicilio", "Celular", "Email_Personal",
+                     "Conyuge_Nombre", "Conyuge_Cedula", "Conyuge_Trabaja",
+                     "Conyuge_Relacion", "Conyuge_Empresa", "Conyuge_Actividad",
+                     "Conyuge_Cargo", "Conyuge_Anios_Cargo",
+                     "Es_PEP", "PEP_Cargo", "Familiar_PEP", "Familiar_PEP_Detalle",
+                     "Otros_Ingresos", "Otros_Ingresos_Detalle",
+                     "Doc_Hoja_Vida", "Doc_Cedula", "Doc_Cedula_Conyuge",
+                     "Doc_Papeleta", "Doc_Papeleta_Conyuge", "Doc_Ref_Laborales",
+                     "Doc_Ref_Personales", "Doc_Servicio_Basico",
+                     "Doc_Declaracion_Patrimonial",
+                     "Fecha_Formulario", "Observaciones", "Registrado_Por", "Actualizado"],
+    "Score_Buro": ["ID_Score", "ID_Empleado", "Fecha", "Score", "Tipo", "Fuente",
+                   "Observaciones", "Registrado_Por"],
+    "Reconocimientos": ["ID_Reconocimiento", "Fecha", "ID_Empleado", "Nombre", "Tipo",
+                        "Motivo", "Otorgado_Por", "Estado"],
 }
+
+# Tipos de reconocimiento que se registran en el expediente
+TIPOS_RECONOCIMIENTO = [
+    "Carta de felicitación",
+    "Reconocimiento por metas",
+    "Mención por atención al cliente",
+    "Reconocimiento por antigüedad",
+    "Otro",
+]
 
 CONFIG_DEFAULTS = {
     "Horario_Inicio":              "09:00",
@@ -92,6 +120,29 @@ CONFIG_DEFAULTS = {
     # Minutos de gracia antes del horario de fin sin que la salida se considere
     # anticipada. En 0, cualquier salida antes de la hora dispara el aviso.
     "Tolerancia_Salida_Minutos":   "0",
+    # Horas antes del horario de inicio en que todavía se acepta marcar entrada.
+    # La ventana va de (Horario_Inicio − este margen) hasta Horario_Fin.
+    "Margen_Registro_Entrada_Horas": "3",
+    # ── Modelo de riesgo operativo por asesor ──────────────────────────────
+    # Pesos de cada factor (suman 100; el sistema normaliza si no).
+    "Riesgo_Peso_Buro":            "30",
+    "Riesgo_Peso_PEP":             "10",
+    "Riesgo_Peso_Documentos":      "15",
+    "Riesgo_Peso_Familiar":        "10",
+    "Riesgo_Peso_Disciplina":      "25",
+    "Riesgo_Peso_Antiguedad":      "10",
+    # Cortes del score de buró (mayor score = mejor comportamiento crediticio)
+    "Buro_Score_Bueno":            "800",
+    "Buro_Score_Malo":             "400",
+    # Umbrales del nivel de riesgo sobre el puntaje 0-100
+    "Riesgo_Umbral_Medio":         "30",
+    "Riesgo_Umbral_Alto":          "55",
+    "Riesgo_Umbral_Critico":       "75",
+    # Calibración de factores
+    "Riesgo_Hijos_Tope":              "4",
+    "Riesgo_Puntos_Disciplina_Tope":  "12",
+    "Riesgo_Peso_Reconocimiento":     "1.5",
+    "Riesgo_Antiguedad_Anios":        "2",
 }
 
 # ── Estados del flujo de aprobación ───────────────────────────────────────────
@@ -108,6 +159,31 @@ EST_RECHAZADO = "Rechazado"
 # hoja de Llamados_Atencion pero NO es una sanción: queda separado de los
 # llamados Verbal / Escrito / Suspensión que emite RRHH a mano.
 TIPO_TARDANZA = "Tardanza (registro automático)"
+
+# Causales operativas de llamado de atención, además de la escala disciplinaria
+# clásica. Auditoría y los jefes de área registran sobre estas.
+CAUSALES_LLAMADO = [
+    "Errores de tasación",
+    "Errores de gestión",
+    "Mala atención al cliente",
+    "Errores en cierre de caja",
+    "Aperturas no autorizadas",
+    "Acumulación de tardanzas",
+    "Incumplimiento de procedimientos",
+    "Otro",
+]
+
+# Gravedad sugerida por causal, para preseleccionar el tipo de llamado.
+GRAVEDAD_CAUSAL = {
+    "Errores de tasación":            "Escrito",
+    "Aperturas no autorizadas":       "Suspensión",
+    "Errores en cierre de caja":      "Escrito",
+    "Errores de gestión":             "Verbal",
+    "Mala atención al cliente":       "Verbal",
+    "Acumulación de tardanzas":       "Verbal",
+    "Incumplimiento de procedimientos": "Verbal",
+    "Otro":                            "Verbal",
+}
 
 # Estados que aún cuentan contra el cupo mensual de permisos
 ESTADOS_VIGENTES = {EST_PEND_JEFE.lower(), EST_PEND_RRHH.lower(), EST_APROBADO.lower(),
@@ -328,6 +404,10 @@ class SheetsManager:
                 self.ensure_columns(hoja)
             except Exception:
                 pass
+        try:
+            self.ensure_hojas_riesgo()
+        except Exception:
+            pass
 
     # ── Configuración ────────────────────────────────────────────────────────
 
@@ -538,9 +618,36 @@ class SheetsManager:
             campos["Observaciones"] = observaciones
         self.update_campos("Asistencia", row_idx, campos)
 
-        return self.evaluar_salida(hora_salida, config or {})
+        permiso = self.tiene_permiso_vigente(id_empleado, fecha)
+        return self.evaluar_salida(hora_salida, config or {}, permiso)
 
-    def evaluar_salida(self, hora_salida: str, config: dict) -> dict:
+    def tiene_permiso_vigente(self, id_empleado: str, fecha: str) -> dict | None:
+        """Devuelve el permiso aprobado o en trámite del empleado en esa fecha.
+
+        Sirve para no marcar como salida anticipada a quien tenía permiso: se
+        fue antes porque estaba autorizado.
+        """
+        df = self.get_permisos()
+        if df.empty or "ID_Empleado" not in df.columns:
+            return None
+        f = self._a_fecha(fecha)
+        for _, r in df.iterrows():
+            if str(r.get("ID_Empleado", "")).strip() != str(id_empleado).strip():
+                continue
+            if self._a_fecha(r.get("Fecha")) != f:
+                continue
+            estado = str(r.get("Estado", "")).strip()
+            if estado in (EST_APROBADO, EST_PEND_JEFE, EST_PEND_RRHH,
+                          "Pendiente", "Pendiente_Aprobacion"):
+                return {"id": str(r.get("ID_Permiso", "")).strip(),
+                        "horas": self._a_numero(r.get("Horas_Solicitadas"), 0),
+                        "motivo": str(r.get("Motivo", "")).strip(),
+                        "estado": estado,
+                        "aprobado": estado == EST_APROBADO}
+        return None
+
+    def evaluar_salida(self, hora_salida: str, config: dict,
+                       permiso: dict | None = None) -> dict:
         """Compara la hora de salida contra el horario de fin.
 
         Solo interesa la salida anticipada. Salir más tarde del horario no
@@ -555,9 +662,13 @@ class SheetsManager:
             return {"anticipada": False, "minutos_antes": 0,
                     "horario_fin": horario_fin, "hora_salida": hora_salida}
         minutos_antes = int((fin - sal).total_seconds() / 60)
-        return {"anticipada": minutos_antes > tolerancia,
+        # Con permiso vigente ese día la salida temprana está autorizada: no es
+        # una salida anticipada y no se avisa a nadie.
+        anticipada = minutos_antes > tolerancia and permiso is None
+        return {"anticipada": anticipada,
                 "minutos_antes": max(0, minutos_antes),
-                "horario_fin": horario_fin, "hora_salida": str(hora_salida)[:5]}
+                "horario_fin": horario_fin, "hora_salida": str(hora_salida)[:5],
+                "permiso": permiso}
 
     def salidas_pendientes(self, dias_atras: int = 7, config: dict | None = None) -> list:
         """Jornadas de días anteriores que quedaron sin marcar la salida.
@@ -1023,6 +1134,344 @@ class SheetsManager:
     def cambiar_password(self, id_empleado: str, nueva_password: str):
         row_idx = self._fila_de("Usuarios", "ID_Empleado", id_empleado)
         self.update_cell("Usuarios", row_idx, 2, hash_password(nueva_password))
+
+
+    # ══════════════════════════════════════════════════════════════════════
+    # KYE – Conozca a su Empleado
+    # ══════════════════════════════════════════════════════════════════════
+
+    def ensure_hojas_riesgo(self):
+        """Crea las hojas de KYE, buró y reconocimientos si no existen."""
+        for hoja in ("KYE_Empleado", "Score_Buro", "Reconocimientos"):
+            try:
+                self._sheet(hoja)
+                self.ensure_columns(hoja)
+            except Exception:
+                try:
+                    cols = HEADERS[hoja]
+                    ws = self.spreadsheet.add_worksheet(title=hoja, rows=500,
+                                                        cols=max(len(cols), 10))
+                    ws.update(range_name=f"A1:{rowcol_to_a1(1, len(cols))}",
+                              values=[cols], value_input_option="USER_ENTERED")
+                except Exception:
+                    pass
+
+    def get_kye(self, id_empleado: str) -> dict:
+        """Ficha KYE del empleado, o dict vacío si aún no se ha llenado."""
+        df = self.get_df("KYE_Empleado")
+        if df.empty or "ID_Empleado" not in df.columns:
+            return {}
+        mask = df["ID_Empleado"].astype(str).str.strip() == str(id_empleado).strip()
+        filas = df[mask]
+        return filas.iloc[-1].to_dict() if not filas.empty else {}
+
+    def guardar_kye(self, id_empleado: str, datos: dict):
+        """Crea o actualiza la ficha KYE del empleado."""
+        df = self.get_df("KYE_Empleado")
+        cols = HEADERS["KYE_Empleado"]
+        fila = [str(datos.get(c, "")) for c in cols]
+        fila[cols.index("ID_Empleado")] = str(id_empleado)
+        fila[cols.index("Actualizado")] = ahora_local().strftime("%Y-%m-%d %H:%M")
+        ids = (df["ID_Empleado"].astype(str).str.strip().tolist()
+               if not df.empty and "ID_Empleado" in df.columns else [])
+        if str(id_empleado).strip() in ids:
+            self.update_row("KYE_Empleado", ids.index(str(id_empleado).strip()) + 2, fila)
+        else:
+            self.append("KYE_Empleado", fila)
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Score de buró
+    # ══════════════════════════════════════════════════════════════════════
+
+    def registrar_score_buro(self, id_empleado: str, score, tipo: str,
+                             fuente: str, registrado_por: str,
+                             observaciones: str = "", fecha=None) -> str:
+        sid = self._next_id("Score_Buro", "ID_Score", "BUR")
+        f = (self._a_fecha(fecha) or hoy_local()).strftime("%Y-%m-%d")
+        self.append("Score_Buro", [sid, id_empleado, f, score, tipo, fuente,
+                                   observaciones, registrado_por])
+        return sid
+
+    def historial_buro(self, id_empleado: str = None) -> pd.DataFrame:
+        df = self.get_df("Score_Buro")
+        if df.empty:
+            return df
+        if id_empleado:
+            df = df[df["ID_Empleado"].astype(str).str.strip() == str(id_empleado).strip()]
+        if "Fecha" in df.columns and not df.empty:
+            df = df.assign(_f=df["Fecha"].map(self._a_fecha)).sort_values("_f").drop(columns="_f")
+        return df
+
+    def score_buro_actual(self, id_empleado: str) -> dict | None:
+        """Último score registrado, y el de ingreso, para ver la evolución."""
+        h = self.historial_buro(id_empleado)
+        if h.empty:
+            return None
+        ultimo = h.iloc[-1]
+        ingreso = h[h["Tipo"].astype(str).str.lower().str.contains("ingreso")]
+        return {
+            "actual": self._a_numero(ultimo.get("Score"), 0),
+            "fecha": self._a_fecha(ultimo.get("Fecha")),
+            "tipo": str(ultimo.get("Tipo", "")),
+            "ingreso": self._a_numero(ingreso.iloc[0].get("Score"), 0) if not ingreso.empty else None,
+            "revisiones": len(h),
+        }
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Reconocimientos y felicitaciones
+    # ══════════════════════════════════════════════════════════════════════
+
+    def registrar_reconocimiento(self, id_empleado: str, nombre: str, tipo: str,
+                                 motivo: str, otorgado_por: str, fecha=None) -> str:
+        rid = self._next_id("Reconocimientos", "ID_Reconocimiento", "REC")
+        f = (self._a_fecha(fecha) or hoy_local()).strftime("%Y-%m-%d")
+        self.append("Reconocimientos", [rid, f, id_empleado, nombre, tipo, motivo,
+                                        otorgado_por, "Vigente"])
+        return rid
+
+    def get_reconocimientos(self, id_empleado: str = None) -> pd.DataFrame:
+        df = self.get_df("Reconocimientos")
+        if df.empty or not id_empleado:
+            return df
+        return df[df["ID_Empleado"].astype(str).str.strip() == str(id_empleado).strip()]
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Matriz de riesgo operativo por asesor
+    # ══════════════════════════════════════════════════════════════════════
+    # El puntaje va de 0 (sin riesgo) a 100 (riesgo máximo). Cada factor
+    # devuelve un valor 0..1 que se multiplica por su peso configurable. Todo
+    # el desglose se devuelve para que la calificación sea auditable: si un
+    # asesor la impugna, se puede mostrar exactamente qué sumó cada factor.
+
+    def _nivel_riesgo(self, puntaje: float, config: dict) -> tuple:
+        u_medio = self._a_numero(config.get("Riesgo_Umbral_Medio"), 30)
+        u_alto  = self._a_numero(config.get("Riesgo_Umbral_Alto"), 55)
+        u_crit  = self._a_numero(config.get("Riesgo_Umbral_Critico"), 75)
+        if puntaje >= u_crit:
+            return "Crítico", "🔴"
+        if puntaje >= u_alto:
+            return "Alto", "🟠"
+        if puntaje >= u_medio:
+            return "Medio", "🟡"
+        return "Bajo", "🟢"
+
+    def _f_buro(self, id_empleado: str, config: dict) -> tuple:
+        """Riesgo por score de buró. Mayor score crediticio = menor riesgo."""
+        s = self.score_buro_actual(id_empleado)
+        if not s or not s["actual"]:
+            return 0.5, "Sin score de buró registrado (se asume riesgo medio)"
+        v = s["actual"]
+        bueno = self._a_numero(config.get("Buro_Score_Bueno"), 800)
+        malo  = self._a_numero(config.get("Buro_Score_Malo"), 400)
+        if v >= bueno:
+            f, txt = 0.0, f"Score {v:.0f}: bueno (≥{bueno:.0f})"
+        elif v <= malo:
+            f, txt = 1.0, f"Score {v:.0f}: deficiente (≤{malo:.0f})"
+        else:
+            f = (bueno - v) / max(1.0, bueno - malo)
+            txt = f"Score {v:.0f}: intermedio entre {malo:.0f} y {bueno:.0f}"
+        if s["ingreso"] and v < s["ingreso"] - 50:
+            f = min(1.0, f + 0.15)
+            txt += f" · deterioro frente al ingreso ({s['ingreso']:.0f})"
+        return f, txt
+
+    def _f_pep(self, kye: dict) -> tuple:
+        propio = str(kye.get("Es_PEP", "")).strip().lower() in ("si", "sí", "true", "1", "x")
+        familiar = str(kye.get("Familiar_PEP", "")).strip().lower() in ("si", "sí", "true", "1", "x")
+        if propio and familiar:
+            return 1.0, "Es PEP y tiene familiar PEP"
+        if propio:
+            return 1.0, "Declarado como Persona Expuesta Políticamente"
+        if familiar:
+            return 0.5, "Tiene familiar o vínculo cercano PEP"
+        return 0.0, "Sin condición PEP declarada"
+
+    DOCS_KYE = ["Doc_Hoja_Vida", "Doc_Cedula", "Doc_Cedula_Conyuge", "Doc_Papeleta",
+                "Doc_Papeleta_Conyuge", "Doc_Ref_Laborales", "Doc_Ref_Personales",
+                "Doc_Servicio_Basico", "Doc_Declaracion_Patrimonial"]
+
+    def _f_documentos(self, kye: dict) -> tuple:
+        if not kye:
+            return 1.0, "Sin ficha KYE registrada"
+        entregados = sum(1 for d in self.DOCS_KYE
+                         if str(kye.get(d, "")).strip().lower() in ("si", "sí", "true", "1", "x"))
+        total = len(self.DOCS_KYE)
+        faltan = total - entregados
+        return (faltan / total), f"{entregados} de {total} documentos verificados"
+
+    def _f_familiar(self, kye: dict, config: dict) -> tuple:
+        """Presión financiera y estabilidad declaradas en el formulario KYE.
+
+        NOTA: incluye estado civil y número de hijos por decisión expresa del
+        área de auditoría. Los pesos son configurables y pueden ponerse en cero.
+        """
+        if not kye:
+            return 0.5, "Sin ficha KYE registrada"
+        partes, f = [], 0.0
+
+        civil = str(kye.get("Estado_Civil", "")).strip().lower()
+        if civil in ("soltero", "soltero(a)", "divorciado", "divorciado(a)",
+                     "separado", "separado(a)", "viudo", "viudo(a)"):
+            f += 0.25; partes.append(f"estado civil {civil or 'no declarado'}")
+        elif civil:
+            partes.append(f"estado civil {civil}")
+
+        hijos = int(self._a_numero(kye.get("Num_Hijos"), 0))
+        tope = int(self._a_numero(config.get("Riesgo_Hijos_Tope"), 4))
+        if hijos:
+            f += 0.25 * min(1.0, hijos / max(1, tope))
+            partes.append(f"{hijos} hijo(s)")
+
+        conyuge_trabaja = str(kye.get("Conyuge_Trabaja", "")).strip().lower() in (
+            "si", "sí", "true", "1", "x")
+        tiene_conyuge = bool(str(kye.get("Conyuge_Nombre", "")).strip())
+        if tiene_conyuge and not conyuge_trabaja:
+            f += 0.35; partes.append("cónyuge sin ingresos propios")
+        elif tiene_conyuge:
+            partes.append("cónyuge con ingresos")
+
+        if str(kye.get("Otros_Ingresos", "")).strip().lower() in ("si", "sí", "true", "1", "x"):
+            f = max(0.0, f - 0.15); partes.append("declara otros ingresos")
+
+        return min(1.0, f), ("Carga familiar: " + ", ".join(partes) if partes
+                             else "Sin datos familiares declarados")
+
+    CAUSALES_CRITICAS = {"Errores de tasación", "Aperturas no autorizadas",
+                         "Errores en cierre de caja"}
+
+    def _f_disciplina(self, id_empleado: str, config: dict) -> tuple:
+        """Llamados formales y tardanzas de los últimos 12 meses."""
+        df = self.llamados_disciplinarios()
+        corte = hoy_local(config) - timedelta(days=365)
+        puntos, detalle = 0.0, []
+        pesos = {"Verbal": 1.0, "Escrito": 3.0, "Suspensión": 6.0}
+        if not df.empty and "ID_Empleado" in df.columns:
+            mios = df[df["ID_Empleado"].astype(str).str.strip() == str(id_empleado).strip()]
+            for _, r in mios.iterrows():
+                f = self._a_fecha(r.get("Fecha"))
+                if not f or f < corte:
+                    continue
+                tipo = str(r.get("Tipo", "")).strip()
+                p = pesos.get(tipo, 1.0)
+                motivo = str(r.get("Motivo", ""))
+                if any(c in motivo for c in self.CAUSALES_CRITICAS):
+                    p *= 2
+                    detalle.append(f"{tipo} por causal crítica")
+                else:
+                    detalle.append(tipo)
+                puntos += p
+
+        # Los reconocimientos compensan parcialmente
+        rec = self.get_reconocimientos(id_empleado)
+        n_rec = 0
+        if not rec.empty:
+            for _, r in rec.iterrows():
+                f = self._a_fecha(r.get("Fecha"))
+                if f and f >= corte:
+                    n_rec += 1
+        if n_rec:
+            puntos = max(0.0, puntos - n_rec * self._a_numero(
+                config.get("Riesgo_Peso_Reconocimiento"), 1.5))
+            detalle.append(f"{n_rec} reconocimiento(s) que compensan")
+
+        tope = self._a_numero(config.get("Riesgo_Puntos_Disciplina_Tope"), 12)
+        texto = ("Últimos 12 meses: " + ", ".join(detalle)) if detalle else \
+                "Sin llamados formales en los últimos 12 meses"
+        return min(1.0, puntos / max(1.0, tope)), texto
+
+    def _f_antiguedad(self, empleado: dict, config: dict) -> tuple:
+        ingreso = self._a_fecha(empleado.get("Fecha_Ingreso"))
+        if not ingreso:
+            return 0.5, "Sin fecha de ingreso registrada"
+        anios = self.anios_servicio(ingreso)
+        umbral = self._a_numero(config.get("Riesgo_Antiguedad_Anios"), 2)
+        if anios >= umbral:
+            return 0.0, f"{anios:.1f} años de antigüedad"
+        return (1 - anios / max(0.1, umbral)), f"{anios:.1f} años (menos de {umbral:.0f})"
+
+    def evaluar_riesgo(self, id_empleado: str, config: dict) -> dict:
+        """Evalúa el riesgo operativo de un asesor.
+
+        Devuelve el puntaje 0-100, el nivel, y el desglose factor por factor
+        con el peso, el valor y la explicación de por qué. Todo el cálculo es
+        reproducible: mismos datos, mismo resultado.
+        """
+        empleado = self.get_empleado(id_empleado) or {}
+        kye = self.get_kye(id_empleado)
+
+        pesos = {
+            "Score de buró":        self._a_numero(config.get("Riesgo_Peso_Buro"), 30),
+            "Condición PEP":        self._a_numero(config.get("Riesgo_Peso_PEP"), 10),
+            "Documentación KYE":    self._a_numero(config.get("Riesgo_Peso_Documentos"), 15),
+            "Situación familiar":   self._a_numero(config.get("Riesgo_Peso_Familiar"), 10),
+            "Historial disciplinario": self._a_numero(config.get("Riesgo_Peso_Disciplina"), 25),
+            "Antigüedad":           self._a_numero(config.get("Riesgo_Peso_Antiguedad"), 10),
+        }
+        f_buro, t_buro = self._f_buro(id_empleado, config)
+        f_pep,  t_pep  = self._f_pep(kye)
+        f_doc,  t_doc  = self._f_documentos(kye)
+        f_fam,  t_fam  = self._f_familiar(kye, config)
+        f_dis,  t_dis  = self._f_disciplina(id_empleado, config)
+        f_ant,  t_ant  = self._f_antiguedad(empleado, config)
+
+        valores = {
+            "Score de buró":           (f_buro, t_buro),
+            "Condición PEP":           (f_pep,  t_pep),
+            "Documentación KYE":       (f_doc,  t_doc),
+            "Situación familiar":      (f_fam,  t_fam),
+            "Historial disciplinario": (f_dis,  t_dis),
+            "Antigüedad":              (f_ant,  t_ant),
+        }
+        total_peso = sum(pesos.values()) or 1.0
+        desglose, puntaje = [], 0.0
+        for nombre, (valor, texto) in valores.items():
+            peso = pesos[nombre]
+            aporte = valor * peso
+            puntaje += aporte
+            desglose.append({
+                "Factor": nombre,
+                "Peso": round(peso, 1),
+                "Nivel del factor": f"{valor*100:.0f}%",
+                "Aporta al puntaje": round(aporte, 1),
+                "Por qué": texto,
+            })
+        # Normalizar a 100 si los pesos no suman 100
+        puntaje = round(puntaje * 100 / total_peso, 1)
+        nivel, icono = self._nivel_riesgo(puntaje, config)
+
+        return {
+            "id_empleado": str(id_empleado),
+            "nombre": str(empleado.get("Nombre", id_empleado)),
+            "area": str(empleado.get("Area", "")),
+            "puntaje": puntaje,
+            "nivel": nivel,
+            "icono": icono,
+            "desglose": desglose,
+            "tiene_kye": bool(kye),
+            "peso_total": total_peso,
+        }
+
+    def matriz_riesgo(self, config: dict) -> pd.DataFrame:
+        """Evaluación de riesgo de todo el personal, ordenada de mayor a menor."""
+        df = self.get_empleados()
+        if df.empty:
+            return pd.DataFrame()
+        filas = []
+        for _, r in df.iterrows():
+            eid = str(r["ID_Empleado"]).strip()
+            if not eid:
+                continue
+            ev = self.evaluar_riesgo(eid, config)
+            filas.append({
+                "ID_Empleado": eid,
+                "Nombre": ev["nombre"],
+                "Área": ev["area"],
+                "Puntaje": ev["puntaje"],
+                "Nivel": f"{ev['icono']} {ev['nivel']}",
+                "Ficha KYE": "Sí" if ev["tiene_kye"] else "Falta",
+            })
+        out = pd.DataFrame(filas)
+        return out.sort_values("Puntaje", ascending=False) if not out.empty else out
 
     # ── Llamados de Atención ─────────────────────────────────────────────────
 

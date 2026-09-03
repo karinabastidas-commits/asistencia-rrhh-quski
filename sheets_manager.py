@@ -56,7 +56,8 @@ SCOPES = [
 HEADERS = {
     "Empleados":    ["ID_Empleado", "Nombre", "Email", "Area", "Email_Jefe", "Horario_Inicio", "Horario_Fin",
                      "Fecha_Ingreso", "Dias_Tomados_Inicial"],
-    "Asistencia":   ["Fecha", "ID_Empleado", "Nombre", "Hora_Entrada", "Hora_Salida", "Estado", "Minutos_Atraso", "Observaciones"],
+    "Asistencia":   ["Fecha", "ID_Empleado", "Nombre", "Hora_Entrada", "Hora_Salida", "Estado",
+                     "Minutos_Atraso", "Observaciones", "Aviso_Salida"],
     "Permisos":     ["ID_Permiso", "Fecha", "ID_Empleado", "Horas_Solicitadas", "Motivo", "Estado",
                      "Horas_Usadas_Mes", "Aprobado_Por",
                      "Aprobado_Jefe", "Fecha_Aprob_Jefe", "Aprobado_RRHH", "Fecha_Aprob_RRHH",
@@ -88,6 +89,9 @@ CONFIG_DEFAULTS = {
     "Dias_Vacaciones_Base":        "15",
     "Anio_Inicio_Dia_Adicional":   "5",
     "Max_Dias_Vacaciones":         "30",
+    # Minutos de gracia antes del horario de fin sin que la salida se considere
+    # anticipada. En 0, cualquier salida antes de la hora dispara el aviso.
+    "Tolerancia_Salida_Minutos":   "0",
 }
 
 # ── Estados del flujo de aprobación ───────────────────────────────────────────
@@ -319,7 +323,7 @@ class SheetsManager:
     def migrar_esquema(self):
         """Asegura que Permisos y Vacaciones tengan las columnas del flujo de
         doble aprobación. Es idempotente: si ya están, no hace nada."""
-        for hoja in ("Permisos", "Vacaciones", "Empleados"):
+        for hoja in ("Permisos", "Vacaciones", "Empleados", "Asistencia"):
             try:
                 self.ensure_columns(hoja)
             except Exception:
@@ -511,18 +515,86 @@ class SheetsManager:
         self.append("Asistencia", [fecha, id_empleado, nombre, hora_entrada, "", estado, int(minutos_atraso), ""])
         return estado, int(minutos_atraso)
 
-    def registrar_salida(self, id_empleado: str, fecha: str, hora_salida: str, observaciones: str = ""):
+    def registrar_salida(self, id_empleado: str, fecha: str, hora_salida: str,
+                         observaciones: str = "", config: dict | None = None) -> dict:
+        """Registra la hora de salida.
+
+        La salida NO genera atrasos ni horas extra: salir después del horario
+        solo deja constancia de la hora. Lo único que se evalúa es si la salida
+        fue ANTICIPADA, para poder avisar al jefe inmediato.
+
+        Devuelve {"anticipada", "minutos_antes", "horario_fin", "hora_salida"}.
+        """
         df = self.get_df("Asistencia")
         if df.empty:
             raise ValueError("No hay registros de asistencia")
         mask = (df["Fecha"].astype(str) == fecha) & (df["ID_Empleado"].astype(str) == str(id_empleado))
         rows = df[mask]
         if rows.empty:
-            raise ValueError(f"No se encontró entrada para {id_empleado} el {fecha}")
+            raise ValueError(f"No se encontró entrada registrada para {id_empleado} el {fecha}")
         row_idx = rows.index[0] + 2
-        self.update_cell("Asistencia", row_idx, 5, hora_salida)
+        campos = {"Hora_Salida": hora_salida}
         if observaciones:
-            self.update_cell("Asistencia", row_idx, 8, observaciones)
+            campos["Observaciones"] = observaciones
+        self.update_campos("Asistencia", row_idx, campos)
+
+        return self.evaluar_salida(hora_salida, config or {})
+
+    def evaluar_salida(self, hora_salida: str, config: dict) -> dict:
+        """Compara la hora de salida contra el horario de fin.
+
+        Solo interesa la salida anticipada. Salir más tarde del horario no
+        produce atraso ni hora extra: se registra la hora y nada más.
+        """
+        horario_fin = str(config.get("Horario_Fin", "17:30"))[:5]
+        tolerancia = int(self._a_numero(config.get("Tolerancia_Salida_Minutos"), 0))
+        try:
+            fin = datetime.strptime(horario_fin, "%H:%M")
+            sal = datetime.strptime(str(hora_salida)[:5], "%H:%M")
+        except ValueError:
+            return {"anticipada": False, "minutos_antes": 0,
+                    "horario_fin": horario_fin, "hora_salida": hora_salida}
+        minutos_antes = int((fin - sal).total_seconds() / 60)
+        return {"anticipada": minutos_antes > tolerancia,
+                "minutos_antes": max(0, minutos_antes),
+                "horario_fin": horario_fin, "hora_salida": str(hora_salida)[:5]}
+
+    def salidas_pendientes(self, dias_atras: int = 7, config: dict | None = None) -> list:
+        """Jornadas de días anteriores que quedaron sin marcar la salida.
+
+        Solo mira días ya cerrados (no el de hoy, que sigue en curso) y omite
+        las que ya tienen aviso enviado, para no repetir correos.
+        """
+        df = self.get_df("Asistencia")
+        if df.empty:
+            return []
+        hoy = hoy_local(config)
+        desde = hoy - timedelta(days=dias_atras)
+        pendientes = []
+        for pos, (_, r) in enumerate(df.iterrows()):
+            f = self._a_fecha(r.get("Fecha"))
+            if not f or not (desde <= f < hoy):
+                continue
+            if str(r.get("Estado", "")).strip().lower() == "ausente":
+                continue
+            if not str(r.get("Hora_Entrada", "")).strip():
+                continue
+            if str(r.get("Hora_Salida", "")).strip():
+                continue
+            if str(r.get("Aviso_Salida", "")).strip():
+                continue        # ya se avisó
+            pendientes.append({
+                "fila": pos + 2,
+                "fecha": f,
+                "id_empleado": str(r.get("ID_Empleado", "")).strip(),
+                "nombre": str(r.get("Nombre", "")).strip(),
+                "hora_entrada": str(r.get("Hora_Entrada", "")).strip(),
+            })
+        return pendientes
+
+    def marcar_aviso_salida(self, fila: int, texto: str):
+        """Deja constancia de que ya se avisó por esta salida sin marcar."""
+        self.update_campos("Asistencia", fila, {"Aviso_Salida": texto})
 
     def marcar_ausencia(self, id_empleado: str, nombre: str, fecha: str, motivo: str = ""):
         self.append("Asistencia", [fecha, id_empleado, nombre, "", "", "Ausente", 0, motivo])

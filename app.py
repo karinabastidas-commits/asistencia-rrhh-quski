@@ -36,6 +36,90 @@ def leer_secrets(seccion: str):
     return None
 
 
+def notificar_salida_anticipada(sm, config, emp_id, nombre, ev, obs=""):
+    """Avisa al jefe inmediato y a RRHH cuando alguien sale antes de su horario.
+
+    Salir DESPUÉS del horario no dispara nada: no es atraso ni hora extra, solo
+    queda la hora registrada.
+    """
+    filas = [("Empleado", f"{emp_id} – {nombre}"),
+             ("Fecha", hoy().strftime("%d/%m/%Y")),
+             ("Hora de salida", ev["hora_salida"]),
+             ("Horario de salida establecido", ev["horario_fin"]),
+             ("Minutos antes de la hora", ev["minutos_antes"])]
+    if obs:
+        filas.append(("Observaciones del empleado", obs))
+    cuerpo = (f"<p><strong>{esc(nombre)}</strong> registró su salida "
+              f"<strong>{ev['minutos_antes']} minuto(s) antes</strong> del horario "
+              f"establecido.</p>" + tabla_html(filas) +
+              "<p style='margin-top:16px;color:#6B7280;font-size:13px'>Aviso automático. "
+              "Salir después del horario no genera ningún aviso.</p>")
+    enviados, fallidos = notificar(
+        [sm.get_email_jefe(emp_id), config.get("Email_RRHH", "")],
+        f"Salida anticipada – {nombre} ({hoy().strftime('%d/%m/%Y')})", cuerpo)
+    if enviados:
+        flash("info", "📧 Salida anticipada notificada a: " + ", ".join(enviados))
+    if fallidos:
+        flash("warning", "⚠️ No se pudo avisar de la salida anticipada a: " + ", ".join(fallidos))
+
+
+def revisar_salidas_pendientes(sm, config, dias: int = 7, mostrar: bool = False) -> int:
+    """Busca jornadas ya cerradas donde nadie marcó la salida y avisa al jefe.
+
+    Solo revisa días anteriores a hoy —la jornada en curso todavía puede
+    cerrarse— y marca cada registro como avisado para no repetir el correo.
+    Agrupa por empleado: si alguien tiene tres días sin marcar, recibe un solo
+    correo con los tres.
+    """
+    try:
+        pendientes = sm.salidas_pendientes(dias, config)
+    except Exception as e:
+        if mostrar:
+            st.error(f"No se pudo revisar las salidas pendientes: {e}")
+        return 0
+    if not pendientes:
+        if mostrar:
+            st.success("✅ No hay jornadas sin salida marcada en los últimos "
+                       f"{dias} días.")
+        return 0
+
+    por_empleado = {}
+    for p in pendientes:
+        por_empleado.setdefault(p["id_empleado"], []).append(p)
+
+    avisados = 0
+    for emp_id, jornadas in por_empleado.items():
+        nombre = jornadas[0]["nombre"] or emp_id
+        filas = [("Empleado", f"{emp_id} – {nombre}"),
+                 ("Jornadas sin salida", len(jornadas))]
+        for j in sorted(jornadas, key=lambda x: x["fecha"]):
+            filas.append((j["fecha"].strftime("%d/%m/%Y"),
+                          f"entrada {j['hora_entrada']} · sin salida"))
+        cuerpo = (f"<p><strong>{esc(nombre)}</strong> tiene "
+                  f"<strong>{len(jornadas)} jornada(s)</strong> sin registrar la hora "
+                  f"de salida.</p>" + tabla_html(filas) +
+                  "<p style='margin-top:16px'>Conviene confirmar con la persona a qué "
+                  "hora salió y que RRHH complete el registro en el sistema.</p>")
+        enviados, fallidos = notificar(
+            [sm.get_email_jefe(emp_id), config.get("Email_RRHH", "")],
+            f"Salida sin marcar – {nombre}", cuerpo)
+        if enviados:
+            avisados += len(jornadas)
+            sello = f"Avisado {ahora().strftime('%Y-%m-%d %H:%M')}"
+            for j in jornadas:
+                try:
+                    sm.marcar_aviso_salida(j["fila"], sello)
+                except Exception:
+                    pass
+        if mostrar:
+            if enviados:
+                st.info(f"📧 {nombre}: {len(jornadas)} jornada(s) — avisado a "
+                        + ", ".join(enviados))
+            if fallidos:
+                st.warning(f"⚠️ {nombre}: no se pudo avisar a " + ", ".join(fallidos))
+    return avisados
+
+
 def notificar_tardanza(sm, config, emp_id, nombre, momento, atraso):
     """Deja constancia del atraso y avisa al jefe inmediato, a RRHH y al empleado.
 
@@ -1052,21 +1136,41 @@ def page_asistencia():
             st.info(f"🕐 Hora actual en Ecuador: **{ahora().strftime('%H:%M')}**")
             st.caption("La hora se toma automáticamente al registrar y no se puede "
                        "modificar. La salida se registra sobre la entrada de hoy.")
+            _hfin = config.get("Horario_Fin", "17:30")
+            st.caption(f"Tu horario de salida es **{_hfin}**. Salir después de esa hora "
+                       "**no genera atraso ni hora extra**: solo queda la hora registrada. "
+                       "Si sales antes, se avisa a tu jefe inmediato.")
             obs = st.text_input("Observaciones (opcional)", key="obs_salida")
 
             if st.button("📌 Registrar mi salida ahora", type="primary"):
                 momento = ahora()
                 try:
                     with st.spinner("Registrando…"):
-                        sm.registrar_salida(emp_id, hoy_str,
-                                            momento.strftime("%H:%M"), obs)
+                        ev = sm.registrar_salida(emp_id, hoy_str,
+                                                 momento.strftime("%H:%M"), obs, config)
                     flash("success", f"✅ Salida de **{nombre}** registrada a las "
                                      f"{momento.strftime('%H:%M')}.")
+                    if ev["anticipada"]:
+                        flash("warning", f"⏱️ Salida **{ev['minutos_antes']} minuto(s) "
+                                         f"antes** del horario ({ev['horario_fin']}). "
+                                         "Se avisó a tu jefe inmediato.")
+                        notificar_salida_anticipada(sm, config, emp_id, nombre, ev, obs)
                     st.rerun()
                 except ValueError as e:
                     st.error(str(e))
                     st.caption("Si no marcaste la entrada hoy, RRHH debe registrarla "
                                "antes de poder marcar la salida.")
+
+    if admin:
+        with st.expander("🔎 Revisar jornadas sin salida marcada"):
+            st.caption("Busca días ya cerrados donde alguien marcó entrada pero no "
+                       "salida, y avisa al jefe inmediato y a RRHH. Cada jornada se "
+                       "avisa una sola vez.")
+            dias_rev = st.number_input("Días hacia atrás a revisar", min_value=1,
+                                       max_value=60, value=7, key="dias_rev_salidas")
+            if st.button("📨 Revisar y avisar", key="btn_rev_salidas"):
+                with st.spinner("Revisando…"):
+                    revisar_salidas_pendientes(sm, config, int(dias_rev), mostrar=True)
 
     with tab3:
         st.subheader("Historial de asistencia")
@@ -1164,6 +1268,11 @@ def page_configuracion():
                 min_value=0, max_value=30, value=_cfg_int(config, "Tolerancia_Minutos", 0))
         with c2:
             h_fin = st.time_input("Horario de salida", _cfg_time(config, "Horario_Fin", "17:30"))
+            tol_salida = st.number_input("Tolerancia de salida (minutos)",
+                min_value=0, max_value=60,
+                value=_cfg_int(config, "Tolerancia_Salida_Minutos", 0),
+                help="Minutos antes del horario de fin que se toleran sin avisar al "
+                     "jefe. En 0, cualquier salida anticipada dispara el aviso.")
             horas_perm = st.number_input("Horas de permiso mensual",
                 min_value=1.0, max_value=20.0, step=0.5, value=_cfg_float(config, "Horas_Permiso_Mensual", 3.0))
 
@@ -1206,6 +1315,7 @@ def page_configuracion():
                 "Horario_Inicio":              h_ini.strftime("%H:%M"),
                 "Horario_Fin":                 h_fin.strftime("%H:%M"),
                 "Tolerancia_Minutos":          str(tolerancia),
+                "Tolerancia_Salida_Minutos":   str(tol_salida),
                 "Horas_Permiso_Mensual":       str(horas_perm),
                 "Email_RRHH":                  email_rrhh,
                 "Zona_Horaria":                zona,
@@ -2617,6 +2727,14 @@ def main():
         return
 
     registrar_entrada_automatica()
+
+    # RRHH revisa una vez por sesión si quedaron jornadas sin salida marcada.
+    if es_admin() and not st.session_state.get("salidas_revisadas"):
+        st.session_state.salidas_revisadas = True
+        n = revisar_salidas_pendientes(get_sm(), st.session_state.config)
+        if n:
+            flash("warning", f"⚠️ Se avisó a los jefes por **{n} jornada(s)** de días "
+                             "anteriores que quedaron sin registrar la salida.")
 
     page = sidebar()
 

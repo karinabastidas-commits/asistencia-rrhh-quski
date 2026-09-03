@@ -285,6 +285,149 @@ def password_debil(password: str) -> str | None:
     return None
 
 
+
+
+# ── Lectura del formulario "Conozca a su Empleado" en Excel ───────────────────
+# El formulario tiene posiciones fijas, así que se leen por coordenada. Los
+# campos de texto salen limpios; los de "marque con una x" son menos confiables
+# porque la marca a veces va dentro de la etiqueta y a veces no se pone, así
+# que se extraen igual pero SIEMPRE se presentan para revisión antes de guardar.
+
+_COORD_KYE = {
+    "apellido1": "C8",  "apellido2": "E8",  "nombres": "G8",  "Cedula": "L8",
+    "Nacionalidad": "C11", "Ciudad_Nacimiento": "D11",
+    "nac_dia": "E11", "nac_mes": "F11", "nac_anio": "G11",
+    "hijos_txt": "E13",
+    "pais": "C18", "Provincia": "D18", "Canton": "E18", "Parroquia": "F18",
+    "Direccion": "G18", "Telefono_Domicilio": "J18", "Celular": "K18",
+    "Email_Personal": "L18",
+    "cy_ap1": "C22", "cy_ap2": "E22", "cy_nom": "G22", "Conyuge_Cedula": "L22",
+    "Conyuge_Empresa": "D33", "Conyuge_Actividad": "F33",
+    "Conyuge_Cargo": "L33", "Conyuge_Anios_Cargo": "M33",
+    "cy_publico": "C33", "cy_privado": "C35", "cy_independiente": "C25",
+    "Fecha_Formulario": "D93",
+}
+
+_CIVIL_COORD = {"H11": "Soltero(a)", "I11": "Casado(a)", "J11": "Divorciado(a)",
+                "K11": "Viudo(a)", "L11": "Separado(a)", "M11": "Unión libre"}
+_SEXO_COORD  = {"C14": "Femenino", "D14": "Masculino"}
+
+
+def _celda(ws, coord: str) -> str:
+    try:
+        v = ws[coord].value
+    except Exception:
+        return ""
+    return "" if v is None else str(v).strip()
+
+
+def _tiene_marca(texto: str) -> bool:
+    """Detecta la 'x' con que se marcan las casillas del formulario."""
+    t = (texto or "").strip().lower()
+    if not t:
+        return False
+    # La marca suele venir pegada a la etiqueta: "Femenino   x"
+    return t.endswith(" x") or t.endswith("\tx") or t == "x" or " x " in f" {t} "
+
+
+def _opcion_marcada(ws, mapa: dict) -> str:
+    """Devuelve la etiqueta cuya casilla está marcada, o cadena vacía."""
+    for coord, etiqueta in mapa.items():
+        if _tiene_marca(_celda(ws, coord)):
+            return etiqueta
+    return ""
+
+
+def _solo_numero(texto: str) -> str:
+    import re
+    m = re.findall(r"\d+", texto or "")
+    return m[-1] if m else ""
+
+
+def leer_formulario_kye(archivo) -> dict:
+    """Extrae los datos de un formulario KYE en Excel.
+
+    Devuelve {"datos": {...campos de KYE_Empleado...},
+              "nombre_detectado": str,
+              "avisos": [str]}   — avisos son los campos que no se pudieron leer
+                                   y hay que confirmar a mano.
+    """
+    import openpyxl
+    wb = openpyxl.load_workbook(archivo, data_only=True)
+    ws = wb["C_EMPLEADO"] if "C_EMPLEADO" in wb.sheetnames else wb[wb.sheetnames[0]]
+
+    c = {k: _celda(ws, v) for k, v in _COORD_KYE.items()}
+    avisos = []
+
+    # Fecha de nacimiento, armada desde tres celdas separadas
+    dia, mes, anio = (_solo_numero(c["nac_dia"]), _solo_numero(c["nac_mes"]),
+                      _solo_numero(c["nac_anio"]))
+    if dia and mes and anio:
+        f_nac = f"{int(anio):04d}-{int(mes):02d}-{int(dia):02d}"
+    else:
+        f_nac = ""
+        avisos.append("Fecha de nacimiento")
+
+    civil = _opcion_marcada(ws, _CIVIL_COORD)
+    if not civil:
+        avisos.append("Estado civil (no se detectó la marca)")
+    sexo = _opcion_marcada(ws, _SEXO_COORD)
+    if not sexo:
+        avisos.append("Sexo (no se detectó la marca)")
+
+    hijos = _solo_numero(c["hijos_txt"])
+    if not hijos:
+        avisos.append("Número de hijos")
+
+    nombre_completo = " ".join(x for x in (c["nombres"], c["apellido1"],
+                                           c["apellido2"]) if x).strip()
+    conyuge = " ".join(x for x in (c["cy_nom"], c["cy_ap1"], c["cy_ap2"]) if x).strip()
+
+    # Relación laboral del cónyuge: la marca está junto a la etiqueta
+    if _tiene_marca(c["cy_publico"]) or c["Conyuge_Empresa"]:
+        relacion = "Empleado público" if _tiene_marca(c["cy_publico"]) else "Empleado privado"
+    elif _tiene_marca(c["cy_privado"]):
+        relacion = "Empleado privado"
+    elif _tiene_marca(c["cy_independiente"]):
+        relacion = "Independiente"
+    else:
+        relacion = ""
+
+    trabaja = "Si" if (c["Conyuge_Empresa"] or c["Conyuge_Cargo"]) else "No"
+
+    # Las declaraciones PEP se marcan con x sobre etiquetas SI/NO. Si no se
+    # detecta marca no se asume nada: es un dato regulatorio, se confirma.
+    pep_si = _tiene_marca(_celda(ws, "L40"))
+    pep_no = _tiene_marca(_celda(ws, "M40"))
+    fam_si = _tiene_marca(_celda(ws, "K46"))
+    fam_no = _tiene_marca(_celda(ws, "L46"))
+    es_pep = "Si" if pep_si else ("No" if pep_no else "")
+    fam_pep = "Si" if fam_si else ("No" if fam_no else "")
+    if not es_pep:
+        avisos.append("Declaración PEP propia")
+    if not fam_pep:
+        avisos.append("Declaración PEP de familiares")
+
+    datos = {
+        "Cedula": c["Cedula"], "Fecha_Nacimiento": f_nac,
+        "Nacionalidad": c["Nacionalidad"], "Ciudad_Nacimiento": c["Ciudad_Nacimiento"],
+        "Estado_Civil": civil, "Sexo": sexo, "Num_Hijos": hijos or "0",
+        "Provincia": c["Provincia"], "Canton": c["Canton"],
+        "Parroquia": c["Parroquia"], "Direccion": c["Direccion"],
+        "Telefono_Domicilio": c["Telefono_Domicilio"], "Celular": c["Celular"],
+        "Email_Personal": c["Email_Personal"],
+        "Conyuge_Nombre": conyuge, "Conyuge_Cedula": c["Conyuge_Cedula"],
+        "Conyuge_Trabaja": trabaja, "Conyuge_Relacion": relacion,
+        "Conyuge_Empresa": c["Conyuge_Empresa"],
+        "Conyuge_Actividad": c["Conyuge_Actividad"],
+        "Conyuge_Cargo": c["Conyuge_Cargo"],
+        "Conyuge_Anios_Cargo": c["Conyuge_Anios_Cargo"],
+        "Es_PEP": es_pep, "Familiar_PEP": fam_pep,
+        "Fecha_Formulario": c["Fecha_Formulario"],
+    }
+    return {"datos": datos, "nombre_detectado": nombre_completo, "avisos": avisos}
+
+
 # ── SheetsManager ─────────────────────────────────────────────────────────────
 class SheetsManager:
     """Wrapper sobre gspread para el spreadsheet de Asistencia RRHH."""

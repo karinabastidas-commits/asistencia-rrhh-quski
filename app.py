@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 import html as _html
 from sheets_manager import (
     SheetsManager, CONFIG_DEFAULTS, ahora_local, hoy_local,
-    es_error_transitorio,
+    es_error_transitorio, leer_formulario_kye,
     EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO, TIPO_TARDANZA,
     CAUSALES_LLAMADO, GRAVEDAD_CAUSAL, TIPOS_RECONOCIMIENTO,
     password_debil,
@@ -2576,7 +2576,49 @@ def page_riesgo_operativo():
             st.success(f"✅ Ficha registrada · última actualización: "
                        f"{k.get('Actualizado', '—')}")
         else:
-            st.info("Este empleado todavía no tiene ficha. Complétala abajo.")
+            st.info("Este empleado todavía no tiene ficha. Puedes subir su "
+                    "formulario en Excel o llenarla a mano abajo.")
+
+        # ── Carga del formulario en Excel ────────────────────────────────────
+        with st.expander("📤 Subir el formulario en Excel y llenar automáticamente",
+                         expanded=not bool(k)):
+            st.caption("Sube el archivo **Conozca a su Empleado** ya lleno. El "
+                       "sistema extrae los datos y precarga el formulario de abajo "
+                       "para que los revises antes de guardar. **Nada se guarda "
+                       "hasta que presiones Guardar ficha KYE.**")
+            archivo = st.file_uploader("Formulario del empleado", type=["xlsx", "xlsm"],
+                                       key=f"up_kye_{emp_id}")
+            if archivo is not None and st.button("📥 Leer el formulario",
+                                                 key=f"btn_kye_{emp_id}"):
+                try:
+                    with st.spinner("Leyendo el formulario…"):
+                        r = leer_formulario_kye(archivo)
+                    st.session_state[f"kye_pre_{emp_id}"] = r["datos"]
+                    leidos = sum(1 for v in r["datos"].values() if str(v).strip())
+                    detectado = r["nombre_detectado"]
+                    if detectado and detectado.lower().split()[0] not in sel.lower():
+                        st.warning(f"⚠️ El formulario dice **{detectado}**, pero "
+                                   f"seleccionaste **{sel}**. Verifica que sea la "
+                                   "persona correcta antes de guardar.")
+                    flash("success", f"📥 Formulario de **{detectado or sel}** leído: "
+                                     f"{leidos} campos precargados. Revísalos y guarda.")
+                    if r["avisos"]:
+                        flash("warning", "Estos campos no se pudieron leer y hay que "
+                                         "completarlos a mano: " + " · ".join(r["avisos"]))
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ No se pudo leer el archivo: {e}")
+                    st.caption("Verifica que sea el formulario estándar de vinculación "
+                               "en formato .xlsx, sin filas ni columnas agregadas.")
+
+        # Los datos leídos del Excel precargan el formulario, sin pisar lo que
+        # ya estuviera guardado con un valor vacío.
+        precarga = st.session_state.get(f"kye_pre_{emp_id}")
+        if precarga:
+            k = {**k, **{kk: vv for kk, vv in precarga.items() if str(vv).strip()}}
+            st.info("📥 Formulario precargado desde el Excel. **Revisa los datos** "
+                    "—sobre todo estado civil, sexo y las declaraciones PEP— y "
+                    "presiona Guardar al final.")
 
         with st.form("form_kye"):
             st.markdown("##### I. Información personal")
@@ -2697,6 +2739,7 @@ def page_riesgo_operativo():
                 try:
                     with st.spinner("Guardando…"):
                         sm.guardar_kye(emp_id, datos)
+                    st.session_state.pop(f"kye_pre_{emp_id}", None)
                     flash("success", f"✅ Ficha KYE de **{sel}** guardada.")
                     st.rerun()
                 except Exception as e:

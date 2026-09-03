@@ -284,6 +284,38 @@ def secciones(etiquetas, key: str) -> str:
                     label_visibility="collapsed")
 
 
+def tabla_segura(df):
+    """Prepara un DataFrame para st.dataframe sin que reviente la pantalla.
+
+    Las hojas de cálculo devuelven columnas con tipos mezclados: un número en
+    una fila y texto vacío en otra, porque el dato aún no se llenó. Arrow, el
+    motor que Streamlit usa para dibujar tablas, no sabe convertir esa mezcla y
+    lanza ValueError, lo que tumba el módulo completo. Aquí se detectan esas
+    columnas y se pasan a texto; las de un solo tipo se dejan intactas para no
+    perder el orden numérico ni el formato de fechas.
+    """
+    if df is None or getattr(df, "empty", True):
+        return df
+    out = df.copy()
+    for col in out.columns:
+        if out[col].dtype != object:
+            continue
+        tipos = set()
+        for v in out[col]:
+            if v is None:
+                continue
+            if isinstance(v, float) and v != v:      # NaN
+                continue
+            tipos.add(type(v))
+            if len(tipos) > 1:
+                break
+        if len(tipos) > 1:
+            out[col] = out[col].map(
+                lambda v: "" if v is None or (isinstance(v, float) and v != v)
+                else str(v))
+    return out
+
+
 def flash(tipo: str, mensaje: str):
     """Guarda un mensaje para mostrarlo DESPUÉS del st.rerun().
 
@@ -992,8 +1024,8 @@ def page_dashboard():
         st.subheader("📅 Asistencia de hoy_str")
         asis_hoy_df = asis_df[asis_df["Fecha"].astype(str) == hoy_str] if not asis_df.empty else pd.DataFrame()
         if not asis_hoy_df.empty:
-            st.dataframe(
-                asis_hoy_df[["ID_Empleado","Nombre","Hora_Entrada","Hora_Salida","Estado","Minutos_Atraso"]],
+            st.dataframe(tabla_segura(
+                asis_hoy_df[["ID_Empleado","Nombre","Hora_Entrada","Hora_Salida","Estado","Minutos_Atraso"]]),
                 use_container_width=True, hide_index=True
             )
         else:
@@ -1015,7 +1047,7 @@ def page_dashboard():
                     columns={"ID_Vacacion":"ID","Fecha_Inicio":"Fecha"}))
         if pendientes:
             df_p = pd.concat(pendientes, ignore_index=True)
-            st.dataframe(df_p, use_container_width=True, hide_index=True)
+            st.dataframe(tabla_segura(df_p), use_container_width=True, hide_index=True)
         else:
             st.success("✅ Sin solicitudes pendientes.")
 
@@ -1056,7 +1088,7 @@ def page_empleados():
             if area_filtro != "Todos":
                 df_f = df_f[df_f["Area"].astype(str) == area_filtro]
 
-            st.dataframe(df_f, use_container_width=True, hide_index=True)
+            st.dataframe(tabla_segura(df_f), use_container_width=True, hide_index=True)
             st.caption(f"{len(df_f)} empleado(s) encontrado(s)")
 
     with tab2:
@@ -1305,7 +1337,7 @@ def page_asistencia():
             if df_filtro.empty:
                 st.info("Sin registros en el período seleccionado.")
             else:
-                st.dataframe(df_filtro, use_container_width=True, hide_index=True)
+                st.dataframe(tabla_segura(df_filtro), use_container_width=True, hide_index=True)
                 st.caption(f"{len(df_filtro)} registro(s)")
                 st.markdown("**Resumen del período**")
                 rc1, rc2, rc3 = st.columns(3)
@@ -1653,7 +1685,7 @@ def page_gestion_usuarios():
         else:
             # Mostrar sin el hash de contraseña
             df_show = df_usr[["ID_Empleado", "Rol"]].copy() if "Password_Hash" in df_usr.columns else df_usr
-            st.dataframe(df_show, use_container_width=True, hide_index=True)
+            st.dataframe(tabla_segura(df_show), use_container_width=True, hide_index=True)
             st.caption(f"{len(df_usr)} usuario(s) registrado(s)")
 
 
@@ -1976,7 +2008,7 @@ def page_saldo_vacaciones():
             c2.metric("Días disponibles en total", f"{disp.sum():.0f}")
             c3.metric("Con saldo negativo", int((disp < 0).sum()))
 
-        st.dataframe(tabla, use_container_width=True, hide_index=True)
+        st.dataframe(tabla_segura(tabla), use_container_width=True, hide_index=True)
         st.caption("**Acumulados** = días ganados desde el ingreso · "
                    "**Carga inicial** = días tomados antes de usar el sistema · "
                    "**Disponibles** = acumulados − (carga inicial + aprobados + en trámite)")
@@ -2113,8 +2145,8 @@ def page_aprobaciones_jefe():
             tarjeta_aprobacion(sm, config, fila, "vacacion", "jefe", firma)
 
     else:
-        st.dataframe(equipo[[c for c in ("ID_Empleado", "Nombre", "Email", "Area")
-                             if c in equipo.columns]],
+        st.dataframe(tabla_segura(equipo[[c for c in ("ID_Empleado", "Nombre", "Email", "Area")
+                             if c in equipo.columns]]),
                      use_container_width=True, hide_index=True)
 
 
@@ -2176,7 +2208,7 @@ def _page_permisos_con_rol():
                 vista = df_pf.copy()
                 if not vista.empty:
                     vista["Estado"] = vista["Estado"].apply(etiqueta_estado_corta)
-                st.dataframe(vista, use_container_width=True, hide_index=True)
+                st.dataframe(tabla_segura(vista), use_container_width=True, hide_index=True)
                 st.caption(f"{len(df_pf)} solicitud(es)")
 
         else:
@@ -2244,7 +2276,7 @@ def _page_permisos_con_rol():
             if df_p.empty:
                 st.info("No tienes solicitudes de permisos.")
             else:
-                st.dataframe(_tabla_estado(df_p, "permiso"),
+                st.dataframe(tabla_segura(_tabla_estado(df_p, "permiso")),
                              use_container_width=True, hide_index=True)
 
 
@@ -2337,7 +2369,7 @@ def _page_vacaciones_con_rol():
                 vista = df_vf.copy()
                 if not vista.empty:
                     vista["Estado"] = vista["Estado"].apply(etiqueta_estado_corta)
-                st.dataframe(vista, use_container_width=True, hide_index=True)
+                st.dataframe(tabla_segura(vista), use_container_width=True, hide_index=True)
                 st.caption(f"{len(df_vf)} solicitud(es)")
 
         else:
@@ -2425,7 +2457,7 @@ def _page_vacaciones_con_rol():
             if df_v.empty:
                 st.info("No tienes solicitudes de vacaciones.")
             else:
-                st.dataframe(_tabla_estado(df_v, "vacacion"),
+                st.dataframe(tabla_segura(_tabla_estado(df_v, "vacacion")),
                              use_container_width=True, hide_index=True)
 
 
@@ -2512,7 +2544,7 @@ def _page_horas_extras_con_rol():
         else:
             filtro_he = st.selectbox("Filtrar", ["Todos", "Pendiente", "Aprobado"])
             df_hef = df_he if filtro_he == "Todos" else df_he[df_he["Estado"].astype(str) == filtro_he]
-            st.dataframe(df_hef, use_container_width=True, hide_index=True)
+            st.dataframe(tabla_segura(df_hef), use_container_width=True, hide_index=True)
             if admin:
                 st.subheader("✅ Aprobar horas extra")
                 pend_he = df_he[df_he["Estado"].astype(str) == "Pendiente"]
@@ -2561,7 +2593,7 @@ def panel_riesgo(sm, config, emp_id, compacto: bool = False):
 
     if not compacto:
         with st.expander("🔍 Desglose completo del cálculo", expanded=False):
-            st.dataframe(pd.DataFrame(ev["desglose"]), use_container_width=True,
+            st.dataframe(tabla_segura(pd.DataFrame(ev["desglose"])), use_container_width=True,
                          hide_index=True)
             st.caption(f"Los pesos suman {ev['peso_total']:.0f} y el puntaje se "
                        "normaliza a 100. Se ajustan en Configuración.")
@@ -2611,7 +2643,7 @@ def page_riesgo_operativo():
             st.warning(f"📋 **{len(sin_kye)}** sin ficha KYE: "
                        + ", ".join(sin_kye["Nombre"].astype(str).tolist()))
 
-        st.dataframe(matriz, use_container_width=True, hide_index=True)
+        st.dataframe(tabla_segura(matriz), use_container_width=True, hide_index=True)
         st.download_button("⬇️ Descargar matriz en CSV",
                            matriz.to_csv(index=False).encode("utf-8"),
                            file_name=f"matriz_riesgo_{hoy().strftime('%Y%m%d')}.csv",
@@ -2848,9 +2880,9 @@ def page_riesgo_operativo():
         if not h.empty:
             st.divider()
             st.subheader("Historial")
-            st.dataframe(h[[c for c in ("Fecha", "Score", "Tipo", "Fuente",
+            st.dataframe(tabla_segura(h[[c for c in ("Fecha", "Score", "Tipo", "Fuente",
                                         "Observaciones", "Registrado_Por")
-                            if c in h.columns]],
+                            if c in h.columns]]),
                          use_container_width=True, hide_index=True)
             serie = h.copy()
             serie["Score"] = pd.to_numeric(serie["Score"], errors="coerce")
@@ -2913,9 +2945,9 @@ def page_riesgo_operativo():
         if not rec.empty:
             st.divider()
             st.subheader(f"Reconocimientos de {nombre_emp}")
-            st.dataframe(rec[[c for c in ("ID_Reconocimiento", "Fecha", "Tipo",
+            st.dataframe(tabla_segura(rec[[c for c in ("ID_Reconocimiento", "Fecha", "Tipo",
                                           "Motivo", "Otorgado_Por")
-                              if c in rec.columns]],
+                              if c in rec.columns]]),
                          use_container_width=True, hide_index=True)
         else:
             st.info("Sin reconocimientos registrados para esta persona.")
@@ -2963,7 +2995,7 @@ def _tabla_documentos(df, mostrar_empleado=False):
         iconos = {"Pendiente": "⏳ Pendiente", "Aprobado": "✅ Aprobado",
                   "Rechazado": "❌ Rechazado"}
         vista["Estado"] = vista["Estado"].map(lambda v: iconos.get(str(v).strip(), v))
-    st.dataframe(vista, use_container_width=True, hide_index=True)
+    st.dataframe(tabla_segura(vista), use_container_width=True, hide_index=True)
     # Los enlaces se listan aparte: dentro de una tabla no son clicables
     with st.expander("🔗 Abrir los archivos en Drive"):
         for _, r in df.iterrows():
@@ -3224,10 +3256,10 @@ def page_formacion():
         if not cursos.empty:
             st.divider()
             st.subheader("Historial de capacitación")
-            st.dataframe(cursos[[c for c in ("ID_Curso", "Curso", "Institucion",
+            st.dataframe(tabla_segura(cursos[[c for c in ("ID_Curso", "Curso", "Institucion",
                                              "Financiamiento", "Fecha_Inicio",
                                              "Fecha_Fin", "Estado", "Horas", "Costo")
-                                 if c in cursos.columns]],
+                                 if c in cursos.columns]]),
                          use_container_width=True, hide_index=True)
 
             if admin:
@@ -3331,7 +3363,7 @@ def page_formacion():
             if "Estado_Validacion" in vista.columns:
                 vista["Estado_Validacion"] = vista["Estado_Validacion"].map(
                     lambda v: iconos.get(str(v).strip(), v))
-            st.dataframe(vista, use_container_width=True, hide_index=True)
+            st.dataframe(tabla_segura(vista), use_container_width=True, hide_index=True)
 
 
 # ── Módulo: Expediente del Empleado (solo admin) ─────────────────────────────
@@ -3408,7 +3440,7 @@ def page_expediente_empleado():
         if asis_emp.empty:
             st.info("Sin registros de asistencia.")
         else:
-            st.dataframe(asis_emp, use_container_width=True, hide_index=True)
+            st.dataframe(tabla_segura(asis_emp), use_container_width=True, hide_index=True)
             r1, r2, r3 = st.columns(3)
             pct_tard = round(total_tard / total_asis * 100, 1) if total_asis else 0
             with r1: st.metric("% Puntualidad", f"{100 - pct_tard:.1f}%")
@@ -3420,7 +3452,7 @@ def page_expediente_empleado():
         if perm_emp.empty:
             st.info("Sin permisos solicitados.")
         else:
-            st.dataframe(perm_emp, use_container_width=True, hide_index=True)
+            st.dataframe(tabla_segura(perm_emp), use_container_width=True, hide_index=True)
             h_total = pd.to_numeric(perm_emp["Horas_Solicitadas"], errors="coerce").fillna(0).sum()
             st.caption(f"Total horas de permiso solicitadas: **{h_total:.1f}h**")
 
@@ -3428,14 +3460,14 @@ def page_expediente_empleado():
         if vac_emp.empty:
             st.info("Sin vacaciones solicitadas.")
         else:
-            st.dataframe(vac_emp, use_container_width=True, hide_index=True)
+            st.dataframe(tabla_segura(vac_emp), use_container_width=True, hide_index=True)
             st.caption(f"Total días hábiles de vacaciones: **{total_vac_d}**")
 
     with tab4:
         if hex_emp.empty:
             st.info("Sin horas extra registradas.")
         else:
-            st.dataframe(hex_emp, use_container_width=True, hide_index=True)
+            st.dataframe(tabla_segura(hex_emp), use_container_width=True, hide_index=True)
             st.caption(f"Total horas extra trabajadas: **{total_hex_h:.1f}h**")
 
     with tab5:
@@ -3449,8 +3481,8 @@ def page_expediente_empleado():
             with l1: metric_card("Verbales", verbales, "🗣️")
             with l2: metric_card("Escritos", escritos, "📝")
             with l3: metric_card("Suspensiones", suspensions, "🚫")
-            st.dataframe(
-                lam_emp[["ID_Llamado", "Fecha", "Tipo", "Motivo", "Atrasos_Acumulados", "Registrado_Por", "Estado"]],
+            st.dataframe(tabla_segura(
+                lam_emp[["ID_Llamado", "Fecha", "Tipo", "Motivo", "Atrasos_Acumulados", "Registrado_Por", "Estado"]]),
                 use_container_width=True, hide_index=True
             )
 
@@ -3569,7 +3601,7 @@ def page_llamados_atencion():
                     lambda x: "🚨 Supera umbral" if x >= umbral else "✅ Normal")
                 resumen = resumen.sort_values("Tardanzas", ascending=False)
 
-                st.dataframe(resumen[["ID_Empleado", "Nombre", "Tardanzas", "Minutos_Total", "Estado"]],
+                st.dataframe(tabla_segura(resumen[["ID_Empleado", "Nombre", "Tardanzas", "Minutos_Total", "Estado"]]),
                              use_container_width=True, hide_index=True)
 
                 alertas = resumen[resumen["Tardanzas"] >= umbral]
@@ -3732,7 +3764,7 @@ def page_llamados_atencion():
             if filtro_tipo != "Todos":
                 df_lf = df_lf[df_lf["Tipo"].astype(str) == filtro_tipo]
 
-            st.dataframe(df_lf, use_container_width=True, hide_index=True)
+            st.dataframe(tabla_segura(df_lf), use_container_width=True, hide_index=True)
             st.caption(f"{len(df_lf)} registro(s)")
 
             if vista == et_disc and not df_disc.empty:
@@ -3740,14 +3772,14 @@ def page_llamados_atencion():
                 st.subheader("Resumen de llamados formales por empleado")
                 resumen_l = (df_disc.groupby(["ID_Empleado", "Nombre"])["Tipo"]
                              .value_counts().unstack(fill_value=0))
-                st.dataframe(resumen_l, use_container_width=True)
+                st.dataframe(tabla_segura(resumen_l), use_container_width=True)
             elif vista == et_tard and not df_tard.empty:
                 st.divider()
                 st.subheader("Atrasos por empleado")
                 resumen_t = (df_tard.groupby(["ID_Empleado", "Nombre"])
                              .size().reset_index(name="Atrasos registrados")
                              .sort_values("Atrasos registrados", ascending=False))
-                st.dataframe(resumen_t, use_container_width=True, hide_index=True)
+                st.dataframe(tabla_segura(resumen_t), use_container_width=True, hide_index=True)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

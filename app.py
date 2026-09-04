@@ -1450,15 +1450,16 @@ def page_horarios():
         st.subheader("Catálogo de horarios")
         st.caption("Un horario por cada jornada distinta que exista: fábrica, "
                    "comercial, call center mañana, call center tarde. El almuerzo "
-                   "se descuenta en horas, sin hora fija, porque cada quien lo toma "
-                   "cuando puede.")
+                   "se descuenta por su duración, sin hora fija: nadie marca la "
+                   "salida a almorzar, así que un atraso para salir no genera "
+                   "ningún aviso.")
         if horarios:
             st.dataframe(tabla_segura(pd.DataFrame([
                 {"ID": h["id"], "Nombre": h["nombre"],
                  "Entrada": h["entrada"], "Salida": h["salida"],
                  "Tolerancia entrada (min)": h["tolerancia_entrada"],
                  "Tolerancia salida (min)": h["tolerancia_salida"],
-                 "Almuerzo (h)": h["horas_almuerzo"]} for h in horarios])),
+                 "Almuerzo (min)": h["minutos_almuerzo"]} for h in horarios])),
                 use_container_width=True, hide_index=True)
         else:
             sin_datos("Todavía no hay horarios. Crea el primero abajo; mientras no "
@@ -1493,12 +1494,16 @@ def page_horarios():
                 tol_s = st.number_input(
                     "Tolerancia de salida (minutos)", min_value=0, max_value=120,
                     value=int(prev["tolerancia_salida"]) if prev else 0,
-                    help="Minutos antes del fin que no cuentan como salida anticipada.")
+                    help="Margen antes de la hora de salida que NO se avisa como "
+                         "salida anticipada. Úsalo donde la jornada no es exacta: "
+                         "en fábrica, si el almuerzo se atrasa, la salida también "
+                         "se corre y sin margen saldrían avisos todos los días.")
             almuerzo = st.number_input(
-                "Horas de almuerzo a descontar", min_value=0.0, max_value=4.0,
-                step=0.5, value=float(prev["horas_almuerzo"]) if prev else 1.0,
-                help="Se resta de la jornada. No se marca: la persona almuerza "
-                     "cuando puede y el sistema descuenta estas horas.")
+                "Minutos de almuerzo a descontar", min_value=0, max_value=240,
+                step=15, value=int(prev["minutos_almuerzo"]) if prev else 60,
+                help="Se resta de la jornada. No se marca a qué hora se toma: "
+                     "la persona almuerza cuando puede y el sistema descuenta "
+                     "esta duración. En fábrica son 30.")
             obs = st.text_input("Observaciones (opcional)")
 
             if st.form_submit_button("💾 Guardar horario", type="primary"):
@@ -1670,14 +1675,14 @@ def page_horarios():
                     filas.append({"Persona": str(emp.get("Nombre", "")),
                                   "Área": str(emp.get("Area", "")),
                                   "Horario": f"error: {e}", "Jornada": "",
-                                  "Almuerzo (h)": "", "Sale de": ""})
+                                  "Almuerzo (min)": "", "Sale de": ""})
                     continue
                 filas.append({
                     "Persona": str(emp.get("Nombre", "")),
                     "Área": str(emp.get("Area", "")),
                     "Horario": h["nombre"],
                     "Jornada": f"{h['entrada']}–{h['salida']}",
-                    "Almuerzo (h)": h["horas_almuerzo"],
+                    "Almuerzo (min)": h["minutos_almuerzo"],
                     "Sale de": h["origen"],
                 })
             st.dataframe(tabla_segura(pd.DataFrame(filas)),

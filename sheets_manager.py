@@ -151,7 +151,7 @@ HEADERS = {
     # Catálogo de horarios. Uno por cada jornada distinta que exista en la
     # empresa: fábrica, comercial, call center mañana, call center tarde…
     "Horarios":     ["ID_Horario", "Nombre", "Entrada", "Salida",
-                     "Tolerancia_Entrada", "Tolerancia_Salida", "Horas_Almuerzo",
+                     "Tolerancia_Entrada", "Tolerancia_Salida", "Minutos_Almuerzo",
                      "Activo", "Observaciones"],
     # Qué horario le toca a cada área. Es la asignación por defecto: alcanza
     # para casi todos y evita tener que tocar ficha por ficha.
@@ -275,10 +275,10 @@ CONFIG_DEFAULTS = {
     # Feriados: fechas AAAA-MM-DD separadas por coma. Sin esto, un feriado
     # nacional aparece en el panel como si todo el equipo hubiera faltado.
     "Feriados":                    "",
-    # Horas de almuerzo que se descuentan de la jornada cuando no hay un
-    # horario propio que lo diga. El almuerzo es flexible: no se marca, se
-    # descuenta.
-    "Horas_Almuerzo":              "0",
+    # Minutos de almuerzo que se descuentan de la jornada cuando no hay un
+    # horario propio que lo diga. El almuerzo es flexible: no se marca a qué
+    # hora se toma, solo se descuenta su duración.
+    "Minutos_Almuerzo":            "0",
     # ── Modelo de riesgo operativo por asesor ──────────────────────────────
     # Pesos de cada factor (suman 100; el sistema normaliza si no).
     "Riesgo_Peso_Buro":            "30",
@@ -1081,6 +1081,25 @@ class SheetsManager:
                 salida.append(h)
         return salida
 
+    @classmethod
+    def _minutos_almuerzo(cls, origen) -> int:
+        """Minutos de almuerzo de una fila u hoja de configuración.
+
+        Acepta la columna vieja en horas para no perder el dato de un libro
+        creado antes de que esto se midiera en minutos.
+        """
+        try:
+            crudo = origen.get("Minutos_Almuerzo", "")
+        except Exception:
+            crudo = ""
+        if str(crudo).strip() not in ("", "nan", "None"):
+            return int(cls._a_numero(crudo, 0))
+        try:
+            horas = origen.get("Horas_Almuerzo", "")
+        except Exception:
+            horas = ""
+        return int(round(cls._a_numero(horas, 0) * 60))
+
     def _horario_desde_fila(self, r) -> dict | None:
         """Convierte una fila de la hoja Horarios en un horario utilizable."""
         ident = str(r.get("ID_Horario", "") or "").strip()
@@ -1095,7 +1114,7 @@ class SheetsManager:
             "salida": salida,
             "tolerancia_entrada": int(self._a_numero(r.get("Tolerancia_Entrada"), 0)),
             "tolerancia_salida": int(self._a_numero(r.get("Tolerancia_Salida"), 0)),
-            "horas_almuerzo": self._a_numero(r.get("Horas_Almuerzo"), 0),
+            "minutos_almuerzo": self._minutos_almuerzo(r),
             "origen": "",
         }
 
@@ -1114,7 +1133,7 @@ class SheetsManager:
                 "salida": str(c.get("Horario_Fin", "17:30"))[:5],
                 "tolerancia_entrada": int(self._a_numero(c.get("Tolerancia_Minutos"), 0)),
                 "tolerancia_salida": int(self._a_numero(c.get("Tolerancia_Salida_Minutos"), 0)),
-                "horas_almuerzo": self._a_numero(c.get("Horas_Almuerzo"), 0),
+                "minutos_almuerzo": self._minutos_almuerzo(c),
                 "origen": ORIGEN_GLOBAL}
 
     def turno_vigente(self, id_empleado: str, fecha) -> dict | None:
@@ -1606,7 +1625,7 @@ class SheetsManager:
         return self.get_df("Vacaciones")
 
     def guardar_horario(self, id_horario, nombre, entrada, salida,
-                        tol_entrada=0, tol_salida=0, horas_almuerzo=0,
+                        tol_entrada=0, tol_salida=0, minutos_almuerzo=0,
                         activo=True, observaciones="") -> str:
         """Crea o actualiza un horario del catálogo."""
         cols = HEADERS["Horarios"]
@@ -1617,7 +1636,7 @@ class SheetsManager:
                      ("Entrada", str(entrada)[:5]), ("Salida", str(salida)[:5]),
                      ("Tolerancia_Entrada", int(tol_entrada)),
                      ("Tolerancia_Salida", int(tol_salida)),
-                     ("Horas_Almuerzo", horas_almuerzo),
+                     ("Minutos_Almuerzo", int(minutos_almuerzo)),
                      ("Activo", "Sí" if activo else "No"),
                      ("Observaciones", observaciones)):
             fila[cols.index(c)] = v
@@ -1818,7 +1837,7 @@ class SheetsManager:
             # se marca— así que se resta el número de horas del horario, no una
             # ventana fija.
             hor = self.horario_de(emp, d1, config)
-            almuerzo = float(hor.get("horas_almuerzo", 0) or 0)
+            almuerzo = float(hor.get("minutos_almuerzo", 0) or 0) / 60
             horas = 0.0
             for m in mias.values():
                 bruto = self._horas_entre(m["entrada"], m["salida"])
@@ -1844,7 +1863,7 @@ class SheetsManager:
                 "horario": hor["nombre"],
                 "horario_origen": hor["origen"],
                 "jornada": f"{hor['entrada']}–{hor['salida']}",
-                "horas_almuerzo": almuerzo,
+                "minutos_almuerzo": int(hor.get("minutos_almuerzo", 0) or 0),
                 "dias_esperados": len(esperados),
                 "dias_marcados": len(dias_con_marca),
                 "dias_sin_marca": sorted(sin_marca),

@@ -190,7 +190,7 @@ def notificar_tardanza(sm, config, emp_id, nombre, momento, atraso):
         flash("warning", "⚠️ " + alerta)
 
 
-def ventana_registro_entrada(config):
+def ventana_registro_entrada(config, horario=None):
     """Rango horario en el que tiene sentido registrar una entrada.
 
     Va desde unas horas antes del horario de inicio hasta el horario de salida.
@@ -201,15 +201,18 @@ def ventana_registro_entrada(config):
     """
     margen = _cfg_int(config, "Margen_Registro_Entrada_Horas", 3)
     try:
-        ini = datetime.strptime(str(config.get("Horario_Inicio", "09:00"))[:5], "%H:%M")
-        fin = datetime.strptime(str(config.get("Horario_Fin", "17:30"))[:5], "%H:%M")
+        h = horario or {}
+        ini = datetime.strptime(str(h.get("entrada") or
+                                    config.get("Horario_Inicio", "09:00"))[:5], "%H:%M")
+        fin = datetime.strptime(str(h.get("salida") or
+                                    config.get("Horario_Fin", "17:30"))[:5], "%H:%M")
     except ValueError:
         return None, None
     return (ini - timedelta(hours=margen)).time(), fin.time()
 
 
-def dentro_de_ventana_entrada(momento, config) -> bool:
-    desde, hasta = ventana_registro_entrada(config)
+def dentro_de_ventana_entrada(momento, config, horario=None) -> bool:
+    desde, hasta = ventana_registro_entrada(config, horario)
     if desde is None:
         return True
     return desde <= momento.time() <= hasta
@@ -280,14 +283,18 @@ def registrar_entrada_automatica():
     momento = ahora()
     config = st.session_state.config
 
+    # La ventana se mide contra el horario de ESA persona: las 07:30 son
+    # tempranas para administrativos y normales para fábrica.
+    horario = sm.horario_de(emp, fecha_hoy, config)
+
     # Fuera del horario laboral no se inventa una entrada.
-    if not dentro_de_ventana_entrada(momento, config):
+    if not dentro_de_ventana_entrada(momento, config, horario):
         try:
             ya = sm.ya_registro_entrada(emp_id, fecha_hoy)
         except Exception:
             ya = True
         if not ya:
-            desde, hasta = ventana_registro_entrada(config)
+            desde, hasta = ventana_registro_entrada(config, horario)
             flash("info", f"ℹ️ No se registró entrada automática porque son las "
                           f"{momento.strftime('%H:%M')}, fuera del horario laboral "
                           f"({desde.strftime('%H:%M')}–{hasta.strftime('%H:%M')}). "
@@ -1085,6 +1092,7 @@ def sidebar():
                 "👥  Empleados",
                 "✅  Asistencia",
                 "📅  Panel Semanal",
+                "🕐  Horarios",
                 "📋  Permisos",
                 "🏖️  Vacaciones",
                 "⏰  Horas Extras",
@@ -1290,6 +1298,10 @@ def page_empleados():
                 dia_oficina = st.selectbox(
                     "Día de oficina", [""] + SM.DIAS_SEMANA,
                     help="Solo para modalidad Mixta: qué día le toca ir.")
+            id_horario = selector_horario(
+                sm, "", "Horario",
+                "Déjalo en «El del área» salvo que esta persona tenga un "
+                "horario distinto al de sus compañeros.")
 
             st.divider()
             st.caption("**Vacaciones** — necesarios para calcular su saldo")
@@ -1316,7 +1328,8 @@ def page_empleados():
                             hora_ini.strftime("%H:%M"), hora_fin.strftime("%H:%M"),
                             f_ingreso.strftime("%Y-%m-%d"), d_tomados,
                             modalidad,
-                            dia_oficina if modalidad == SM.MOD_MIXTO else ""
+                            dia_oficina if modalidad == SM.MOD_MIXTO else "",
+                            id_horario
                         )
                     st.success(f"✅ Empleado creado: **{emp_id} – {nombre}**")
 
@@ -1358,6 +1371,13 @@ def page_empleados():
                         "Día de oficina", opciones_dia,
                         index=opciones_dia.index(dia_prev) if dia_prev in opciones_dia else 0,
                         help="Solo para modalidad Mixta.")
+                id_horario = selector_horario(
+                    sm, str(emp.get("ID_Horario", "") or "").strip(), "Horario",
+                    "Déjalo en «El del área» salvo que esta persona tenga un "
+                    "horario distinto al de sus compañeros.")
+                _h = sm.horario_de(emp, hoy(), st.session_state.config)
+                st.caption(f"Hoy se le aplica **{_h['nombre']}** "
+                           f"({_h['entrada']}–{_h['salida']}) — {_h['origen']}.")
 
                 st.divider()
                 st.caption("**Vacaciones**")
@@ -1383,10 +1403,299 @@ def page_empleados():
                             hora_ini.strftime("%H:%M"), hora_fin.strftime("%H:%M"),
                             f_ingreso.strftime("%Y-%m-%d"), d_tomados,
                             modalidad,
-                            dia_oficina if modalidad == SM.MOD_MIXTO else ""
+                            dia_oficina if modalidad == SM.MOD_MIXTO else "",
+                            id_horario
                         )
                     flash("success", "✅ Empleado actualizado")
                     st.rerun()
+
+
+# ── Módulo: Horarios ──────────────────────────────────────────────────────────
+def selector_horario(sm, actual: str, etiqueta: str = "Horario", ayuda: str = ""):
+    """Desplegable de horarios del catálogo. Devuelve el ID, o "" si ninguno."""
+    try:
+        horarios = sm.horarios_activos()
+    except Exception:
+        horarios = []
+    etiquetas = ["— El del área —"] + [
+        f"{h['id']} · {h['nombre']} ({h['entrada']}–{h['salida']})" for h in horarios]
+    ids = [""] + [h["id"] for h in horarios]
+    idx = ids.index(actual) if actual in ids else 0
+    elegido = st.selectbox(etiqueta, etiquetas, index=idx, help=ayuda or None,
+                           key=f"sel_horario_{etiqueta}")
+    return ids[etiquetas.index(elegido)]
+
+
+def page_horarios():
+    """Catálogo de horarios, asignación por área y turnos rotativos."""
+    sm = get_sm()
+    config = st.session_state.config
+    st.title("🕐 Horarios y turnos")
+
+    ET_CAT, ET_AREA, ET_TUR, ET_QUIEN = ("📋 Horarios", "🏢 Por área",
+                                         "🔄 Turnos", "🔍 Quién tiene qué")
+    seccion = secciones([ET_CAT, ET_AREA, ET_TUR, ET_QUIEN], "sec_horarios")
+    st.divider()
+
+    try:
+        horarios = sm.horarios_activos()
+    except Exception as e:
+        st.error(f"No se pudo leer el catálogo de horarios: {type(e).__name__}: {e}")
+        return
+    op_hor = {f"{h['id']} · {h['nombre']} ({h['entrada']}–{h['salida']})": h["id"]
+              for h in horarios}
+
+    # ── Catálogo ───────────────────────────────────────────────────────────
+    if seccion == ET_CAT:
+        st.subheader("Catálogo de horarios")
+        st.caption("Un horario por cada jornada distinta que exista: fábrica, "
+                   "comercial, call center mañana, call center tarde. El almuerzo "
+                   "se descuenta en horas, sin hora fija, porque cada quien lo toma "
+                   "cuando puede.")
+        if horarios:
+            st.dataframe(tabla_segura(pd.DataFrame([
+                {"ID": h["id"], "Nombre": h["nombre"],
+                 "Entrada": h["entrada"], "Salida": h["salida"],
+                 "Tolerancia entrada (min)": h["tolerancia_entrada"],
+                 "Tolerancia salida (min)": h["tolerancia_salida"],
+                 "Almuerzo (h)": h["horas_almuerzo"]} for h in horarios])),
+                use_container_width=True, hide_index=True)
+        else:
+            sin_datos("Todavía no hay horarios. Crea el primero abajo; mientras no "
+                      "haya ninguno, rige el horario general de Configuración.", "info")
+
+        st.divider()
+        editar = st.selectbox("Editar uno existente o crear nuevo",
+                              ["➕ Crear nuevo"] + list(op_hor.keys()),
+                              key="hor_editar")
+        prev = None
+        if editar != "➕ Crear nuevo":
+            prev = next((h for h in horarios if h["id"] == op_hor[editar]), None)
+
+        with st.form("form_horario"):
+            c1, c2 = st.columns(2)
+            with c1:
+                nombre = st.text_input("Nombre del horario *",
+                                       value=prev["nombre"] if prev else "",
+                                       placeholder="Comercial, Call Center mañana…")
+                entrada = st.time_input(
+                    "Hora de entrada",
+                    value=_hora_o(prev["entrada"] if prev else "09:00"))
+                tol_e = st.number_input(
+                    "Tolerancia de entrada (minutos)", min_value=0, max_value=120,
+                    value=int(prev["tolerancia_entrada"]) if prev else 0,
+                    help="Minutos de gracia antes de que cuente como atraso.")
+            with c2:
+                activo = st.checkbox("Activo", value=True if not prev else True)
+                salida = st.time_input(
+                    "Hora de salida",
+                    value=_hora_o(prev["salida"] if prev else "17:30"))
+                tol_s = st.number_input(
+                    "Tolerancia de salida (minutos)", min_value=0, max_value=120,
+                    value=int(prev["tolerancia_salida"]) if prev else 0,
+                    help="Minutos antes del fin que no cuentan como salida anticipada.")
+            almuerzo = st.number_input(
+                "Horas de almuerzo a descontar", min_value=0.0, max_value=4.0,
+                step=0.5, value=float(prev["horas_almuerzo"]) if prev else 1.0,
+                help="Se resta de la jornada. No se marca: la persona almuerza "
+                     "cuando puede y el sistema descuenta estas horas.")
+            obs = st.text_input("Observaciones (opcional)")
+
+            if st.form_submit_button("💾 Guardar horario", type="primary"):
+                if not nombre.strip():
+                    st.error("El horario necesita un nombre.")
+                elif entrada >= salida:
+                    st.error("La hora de salida tiene que ser posterior a la de "
+                             "entrada. Si es un turno que cruza la medianoche, "
+                             "avísame: eso necesita otro tratamiento.")
+                else:
+                    with st.spinner("Guardando…"):
+                        ident = sm.guardar_horario(
+                            prev["id"] if prev else "", nombre.strip(),
+                            entrada.strftime("%H:%M"), salida.strftime("%H:%M"),
+                            tol_e, tol_s, almuerzo, activo, obs)
+                    flash("success", f"✅ Horario **{ident} · {nombre}** guardado.")
+                    st.rerun()
+
+    # ── Asignación por área ────────────────────────────────────────────────
+    elif seccion == ET_AREA:
+        st.subheader("Qué horario le toca a cada área")
+        st.caption("Es la asignación por defecto y la que menos mantenimiento pide: "
+                   "alcanza para casi todos, y quien tenga un caso especial se "
+                   "resuelve en su ficha o con un turno.")
+        if not horarios:
+            st.warning("Primero crea al menos un horario en la sección «Horarios».")
+        else:
+            df_emp = sm.get_empleados()
+            areas = (sorted(a for a in df_emp["Area"].astype(str).str.strip().unique() if a)
+                     if not df_emp.empty and "Area" in df_emp.columns else [])
+            if not areas:
+                sin_datos("No hay áreas registradas todavía.", "info")
+            else:
+                asignado = {}
+                for a in areas:
+                    try:
+                        h = sm.horario_de_area(a)
+                    except Exception:
+                        h = None
+                    asignado[a] = h
+                st.dataframe(tabla_segura(pd.DataFrame([
+                    {"Área": a, "Personas": int((df_emp["Area"].astype(str).str.strip() == a).sum()),
+                     "Horario": (f"{h['nombre']} ({h['entrada']}–{h['salida']})"
+                                 if h else "— usa el horario general —")}
+                    for a, h in asignado.items()])),
+                    use_container_width=True, hide_index=True)
+
+                st.divider()
+                with st.form("form_area"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        area = st.selectbox("Área", areas)
+                    with c2:
+                        hh = st.selectbox("Horario", list(op_hor.keys()))
+                    if st.form_submit_button("💾 Asignar", type="primary"):
+                        with st.spinner("Guardando…"):
+                            sm.asignar_horario_area(area, op_hor[hh])
+                        flash("success", f"✅ **{area}** ahora usa el horario "
+                                         f"**{hh}**.")
+                        st.rerun()
+
+    # ── Turnos ─────────────────────────────────────────────────────────────
+    elif seccion == ET_TUR:
+        st.subheader("Turnos con fecha")
+        st.caption("Para el call center, que rota. Un turno manda sobre el horario "
+                   "del área y sobre el de la ficha mientras esté vigente; cuando "
+                   "termina, la persona vuelve sola a su horario habitual.")
+        if not horarios:
+            st.warning("Primero crea los horarios de cada turno en «Horarios».")
+        else:
+            df_emp = sm.get_empleados()
+            opciones = emp_opciones(df_emp)
+            if not opciones:
+                sin_datos("No hay empleados registrados.", "warning")
+            else:
+                with st.form("form_turno"):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        sel = st.multiselect(
+                            "Personas", list(opciones.keys()),
+                            help="Puedes asignar el mismo turno a varias personas "
+                                 "de una vez.")
+                        hh = st.selectbox("Turno", list(op_hor.keys()))
+                    with c2:
+                        lunes = hoy() - timedelta(days=hoy().weekday())
+                        f_ini = st.date_input("Desde", value=lunes)
+                        f_fin = st.date_input("Hasta", value=lunes + timedelta(days=6))
+                    obs = st.text_input("Observaciones (opcional)")
+                    if st.form_submit_button("💾 Asignar turno", type="primary"):
+                        if not sel:
+                            st.error("Elige al menos una persona.")
+                        elif f_fin < f_ini:
+                            st.error("La fecha «hasta» no puede ser anterior a «desde».")
+                        else:
+                            with st.spinner("Asignando…"):
+                                for etq in sel:
+                                    emp_id, _n = opciones[etq]
+                                    sm.asignar_turno(
+                                        emp_id, f_ini.strftime("%Y-%m-%d"),
+                                        f_fin.strftime("%Y-%m-%d"), op_hor[hh],
+                                        get_usuario().get("nombre", ""), obs)
+                            flash("success", f"✅ Turno asignado a {len(sel)} "
+                                             f"persona(s) del {f_ini:%d/%m} al "
+                                             f"{f_fin:%d/%m}.")
+                            st.rerun()
+
+                st.divider()
+                st.markdown("**Turnos cargados**")
+                try:
+                    df_t = sm.get_df("Turnos")
+                except Exception as e:
+                    df_t = pd.DataFrame()
+                    st.error(f"No se pudieron leer los turnos: {e}")
+                if df_t.empty:
+                    # sin_datos y no st.info: si la lectura de Google falló,
+                    # «no hay turnos» haría pensar que se borraron.
+                    sin_datos("Todavía no hay turnos asignados.", "info")
+                else:
+                    nombres = {str(r["ID_Empleado"]).strip(): str(r["Nombre"])
+                               for _, r in df_emp.iterrows()} if not df_emp.empty else {}
+                    hnom = {h["id"]: h["nombre"] for h in horarios}
+                    vigentes = []
+                    for _, r in df_t.iterrows():
+                        d0 = sm._a_fecha(r.get("Fecha_Desde"))
+                        d1 = sm._a_fecha(r.get("Fecha_Fin"))
+                        if not d0:
+                            continue
+                        vigentes.append({
+                            "ID": str(r.get("ID_Turno", "")),
+                            "Persona": nombres.get(str(r.get("ID_Empleado", "")).strip(),
+                                                   str(r.get("ID_Empleado", ""))),
+                            "Turno": hnom.get(str(r.get("ID_Horario", "")).strip(),
+                                              str(r.get("ID_Horario", ""))),
+                            "Desde": d0.strftime("%d/%m/%Y"),
+                            "Hasta": d1.strftime("%d/%m/%Y") if d1 else "sin fin",
+                            "Estado": ("🟢 vigente" if d0 <= hoy() and (not d1 or hoy() <= d1)
+                                       else ("🕓 futuro" if d0 > hoy() else "⚪ terminado")),
+                        })
+                    vigentes.sort(key=lambda x: x["Desde"], reverse=True)
+                    st.dataframe(tabla_segura(pd.DataFrame(vigentes)),
+                                 use_container_width=True, hide_index=True)
+                    borrar = st.selectbox("Quitar un turno",
+                                          ["—"] + [f"{v['ID']} · {v['Persona']} · "
+                                                   f"{v['Desde']}–{v['Hasta']}"
+                                                   for v in vigentes],
+                                          key="turno_borrar")
+                    if borrar != "—" and st.button("🗑️ Quitar turno"):
+                        with st.spinner("Quitando…"):
+                            sm.borrar_turno(borrar.split(" · ")[0])
+                        flash("success", "✅ Turno quitado.")
+                        st.rerun()
+
+    # ── Quién tiene qué ────────────────────────────────────────────────────
+    else:
+        st.subheader("Qué horario se le aplica hoy a cada persona")
+        st.caption("El orden de prioridad es: turno con fecha, luego el horario de "
+                   "su ficha, luego el de su área, y si no hay nada, el general de "
+                   "Configuración.")
+        fecha = st.date_input("Fecha a consultar", value=hoy(), key="hor_fecha")
+        df_emp = sm.get_empleados()
+        if df_emp.empty:
+            sin_datos("No hay empleados registrados.", "info")
+        else:
+            filas = []
+            for _, emp in df_emp.iterrows():
+                try:
+                    h = sm.horario_de(emp, fecha, config)
+                except Exception as e:
+                    filas.append({"Persona": str(emp.get("Nombre", "")),
+                                  "Área": str(emp.get("Area", "")),
+                                  "Horario": f"error: {e}", "Jornada": "",
+                                  "Almuerzo (h)": "", "Sale de": ""})
+                    continue
+                filas.append({
+                    "Persona": str(emp.get("Nombre", "")),
+                    "Área": str(emp.get("Area", "")),
+                    "Horario": h["nombre"],
+                    "Jornada": f"{h['entrada']}–{h['salida']}",
+                    "Almuerzo (h)": h["horas_almuerzo"],
+                    "Sale de": h["origen"],
+                })
+            st.dataframe(tabla_segura(pd.DataFrame(filas)),
+                         use_container_width=True, hide_index=True)
+            n_global = sum(1 for f in filas if f["Sale de"] == SM.ORIGEN_GLOBAL)
+            if n_global:
+                st.warning(f"⚠️ {n_global} persona(s) siguen con el horario general "
+                           "de la empresa porque su área no tiene uno asignado. "
+                           "Si su jornada es distinta, sus atrasos se están "
+                           "midiendo contra la hora equivocada.")
+
+
+def _hora_o(txt: str):
+    """Convierte HH:MM a time, con 09:00 de respaldo si viene algo raro."""
+    try:
+        return datetime.strptime(str(txt)[:5], "%H:%M").time()
+    except (ValueError, TypeError):
+        return datetime.strptime("09:00", "%H:%M").time()
 
 
 # ── Módulo: Panel semanal ─────────────────────────────────────────────────────
@@ -1625,11 +1934,14 @@ def page_asistencia():
                 # Fuera del horario, una entrada equivale a horas de atraso en
                 # el expediente. No puede quedar a un clic de distancia de
                 # alguien que entró aquí buscando marcar su salida.
-                fuera = not dentro_de_ventana_entrada(ahora(), config)
+                _hor = sm.horario_de(emp_id, hoy_str, config)
+                st.caption(f"Horario aplicado: **{_hor['nombre']}** "
+                           f"({_hor['entrada']}–{_hor['salida']}) — {_hor['origen']}.")
+                fuera = not dentro_de_ventana_entrada(ahora(), config, _hor)
                 confirmado = True
                 if fuera:
-                    _d, _h = ventana_registro_entrada(config)
-                    _atraso = sm.minutos_de_atraso(ahora().strftime("%H:%M"), config)
+                    _d, _h = ventana_registro_entrada(config, _hor)
+                    _atraso = sm.minutos_de_atraso(ahora().strftime("%H:%M"), config, _hor)
                     st.warning(f"⚠️ Son las {ahora().strftime('%H:%M')}, fuera del "
                                f"horario laboral ({_d.strftime('%H:%M')}–{_h.strftime('%H:%M')}). "
                                f"Registrar la entrada ahora quedaría como "
@@ -4524,6 +4836,7 @@ def main():
             "Empleados":         page_empleados,
             "Asistencia":        page_asistencia,
             "Panel Semanal":     page_panel_semanal,
+            "Horarios":          page_horarios,
             "Permisos":          _page_permisos_con_rol,
             "Vacaciones":        _page_vacaciones_con_rol,
             "Horas Extras":      _page_horas_extras_con_rol,

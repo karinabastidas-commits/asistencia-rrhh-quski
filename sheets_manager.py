@@ -146,7 +146,20 @@ SCOPES = [
 
 HEADERS = {
     "Empleados":    ["ID_Empleado", "Nombre", "Email", "Area", "Email_Jefe", "Horario_Inicio", "Horario_Fin",
-                     "Fecha_Ingreso", "Dias_Tomados_Inicial", "Modalidad", "Dia_Oficina"],
+                     "Fecha_Ingreso", "Dias_Tomados_Inicial", "Modalidad", "Dia_Oficina",
+                     "ID_Horario"],
+    # Catálogo de horarios. Uno por cada jornada distinta que exista en la
+    # empresa: fábrica, comercial, call center mañana, call center tarde…
+    "Horarios":     ["ID_Horario", "Nombre", "Entrada", "Salida",
+                     "Tolerancia_Entrada", "Tolerancia_Salida", "Horas_Almuerzo",
+                     "Activo", "Observaciones"],
+    # Qué horario le toca a cada área. Es la asignación por defecto: alcanza
+    # para casi todos y evita tener que tocar ficha por ficha.
+    "Horarios_Area": ["Area", "ID_Horario"],
+    # Turnos con fecha: para el call center, que rota. Manda sobre el horario
+    # del área y sobre el de la ficha, porque es lo más específico.
+    "Turnos":       ["ID_Turno", "ID_Empleado", "Fecha_Desde", "Fecha_Fin",
+                     "ID_Horario", "Registrado_Por", "Observaciones"],
     "Asistencia":   ["Fecha", "ID_Empleado", "Nombre", "Hora_Entrada", "Hora_Salida", "Estado",
                      "Minutos_Atraso", "Observaciones", "Aviso_Salida",
                      "Dispositivo_Entrada", "Dispositivo_Salida"],
@@ -262,6 +275,10 @@ CONFIG_DEFAULTS = {
     # Feriados: fechas AAAA-MM-DD separadas por coma. Sin esto, un feriado
     # nacional aparece en el panel como si todo el equipo hubiera faltado.
     "Feriados":                    "",
+    # Horas de almuerzo que se descuentan de la jornada cuando no hay un
+    # horario propio que lo diga. El almuerzo es flexible: no se marca, se
+    # descuenta.
+    "Horas_Almuerzo":              "0",
     # ── Modelo de riesgo operativo por asesor ──────────────────────────────
     # Pesos de cada factor (suman 100; el sistema normaliza si no).
     "Riesgo_Peso_Buro":            "30",
@@ -316,6 +333,14 @@ MOD_MIXTO       = "Mixto"          # teletrabajo con un día fijo de oficina
 MODALIDADES = (MOD_PRESENCIAL, MOD_TELETRABAJO, MOD_MIXTO)
 
 DIAS_SEMANA = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes"]
+
+# De dónde salió el horario que se le aplicó a una persona. Se guarda junto al
+# horario para poder explicarlo en pantalla: si alguien reclama un atraso, lo
+# primero que hay que poder decir es contra qué hora se lo midió y por qué.
+ORIGEN_TURNO  = "Turno asignado"
+ORIGEN_FICHA  = "Horario propio (ficha)"
+ORIGEN_AREA   = "Horario del área"
+ORIGEN_GLOBAL = "Horario general de la empresa"
 
 
 EST_PEND_JEFE = "Pendiente_Jefe"
@@ -901,7 +926,8 @@ class SheetsManager:
 
     @staticmethod
     def _fila_empleado(emp_id, nombre, email, area, email_jefe, hora_inicio, hora_fin,
-                       fecha_ingreso, dias_tomados_inicial, modalidad, dia_oficina) -> list:
+                       fecha_ingreso, dias_tomados_inicial, modalidad, dia_oficina,
+                       id_horario="") -> list:
         """Arma la fila por NOMBRE de columna, no por posición.
 
         Antes se pasaba una lista en orden fijo; al agregar columnas al final,
@@ -915,26 +941,28 @@ class SheetsManager:
                      ("Horario_Inicio", hora_inicio), ("Horario_Fin", hora_fin),
                      ("Fecha_Ingreso", fecha_ingreso),
                      ("Dias_Tomados_Inicial", dias_tomados_inicial),
-                     ("Modalidad", modalidad), ("Dia_Oficina", dia_oficina)):
+                     ("Modalidad", modalidad), ("Dia_Oficina", dia_oficina),
+                     ("ID_Horario", id_horario)):
             fila[cols.index(c)] = v
         return fila
 
     def agregar_empleado(self, nombre, email, area, email_jefe, hora_inicio, hora_fin,
                          fecha_ingreso="", dias_tomados_inicial=0,
-                         modalidad=MOD_PRESENCIAL, dia_oficina="") -> str:
+                         modalidad=MOD_PRESENCIAL, dia_oficina="",
+                         id_horario="") -> str:
         emp_id = self.next_id_empleado()
         self.append("Empleados", self._fila_empleado(
             emp_id, nombre, email, area, email_jefe, hora_inicio, hora_fin,
-            fecha_ingreso, dias_tomados_inicial, modalidad, dia_oficina))
+            fecha_ingreso, dias_tomados_inicial, modalidad, dia_oficina, id_horario))
         return emp_id
 
     def actualizar_empleado(self, emp_id: str, nombre, email, area, email_jefe,
                             hora_inicio, hora_fin, fecha_ingreso="", dias_tomados_inicial=0,
-                            modalidad=MOD_PRESENCIAL, dia_oficina=""):
+                            modalidad=MOD_PRESENCIAL, dia_oficina="", id_horario=""):
         row_idx = self._fila_de("Empleados", "ID_Empleado", emp_id)
         self.update_row("Empleados", row_idx, self._fila_empleado(
             emp_id, nombre, email, area, email_jefe, hora_inicio, hora_fin,
-            fecha_ingreso, dias_tomados_inicial, modalidad, dia_oficina))
+            fecha_ingreso, dias_tomados_inicial, modalidad, dia_oficina, id_horario))
 
     def set_datos_vacaciones(self, emp_id: str, fecha_ingreso, dias_tomados_inicial):
         """Carga inicial: fecha de ingreso y días ya tomados antes del sistema."""
@@ -1034,7 +1062,132 @@ class SheetsManager:
                 "estado": str(r.get("Estado", "") or "").strip(),
                 "completa": bool(ent and sal)}
 
-    def minutos_de_atraso(self, hora, config: dict) -> int:
+    # ── Horarios ─────────────────────────────────────────────────────────────
+
+    def get_horarios(self) -> pd.DataFrame:
+        return self.get_df("Horarios")
+
+    def horarios_activos(self) -> list:
+        """Los horarios utilizables, como diccionarios listos para usar."""
+        df = self.get_horarios()
+        if df.empty:
+            return []
+        salida = []
+        for _, r in df.iterrows():
+            if str(r.get("Activo", "Sí")).strip().lower() in ("no", "0", "false"):
+                continue
+            h = self._horario_desde_fila(r)
+            if h:
+                salida.append(h)
+        return salida
+
+    def _horario_desde_fila(self, r) -> dict | None:
+        """Convierte una fila de la hoja Horarios en un horario utilizable."""
+        ident = str(r.get("ID_Horario", "") or "").strip()
+        entrada = str(r.get("Entrada", "") or "").strip()[:5]
+        salida = str(r.get("Salida", "") or "").strip()[:5]
+        if not ident or not entrada or not salida:
+            return None
+        return {
+            "id": ident,
+            "nombre": str(r.get("Nombre", "") or ident).strip(),
+            "entrada": entrada,
+            "salida": salida,
+            "tolerancia_entrada": int(self._a_numero(r.get("Tolerancia_Entrada"), 0)),
+            "tolerancia_salida": int(self._a_numero(r.get("Tolerancia_Salida"), 0)),
+            "horas_almuerzo": self._a_numero(r.get("Horas_Almuerzo"), 0),
+            "origen": "",
+        }
+
+    def horario_por_id(self, id_horario: str) -> dict | None:
+        df = self.get_horarios()
+        if df.empty or not str(id_horario).strip():
+            return None
+        m = df[df["ID_Horario"].astype(str).str.strip() == str(id_horario).strip()]
+        return self._horario_desde_fila(m.iloc[0]) if not m.empty else None
+
+    def horario_global(self, config: dict | None = None) -> dict:
+        """El horario de Configuración, que es el que rige si no hay otro."""
+        c = config or {}
+        return {"id": "", "nombre": "General",
+                "entrada": str(c.get("Horario_Inicio", "09:00"))[:5],
+                "salida": str(c.get("Horario_Fin", "17:30"))[:5],
+                "tolerancia_entrada": int(self._a_numero(c.get("Tolerancia_Minutos"), 0)),
+                "tolerancia_salida": int(self._a_numero(c.get("Tolerancia_Salida_Minutos"), 0)),
+                "horas_almuerzo": self._a_numero(c.get("Horas_Almuerzo"), 0),
+                "origen": ORIGEN_GLOBAL}
+
+    def turno_vigente(self, id_empleado: str, fecha) -> dict | None:
+        """El turno con fechas que cubre ese día, si lo hay.
+
+        Si hay varios que se solapan —cosa que pasa cuando se corrige una
+        asignación sin borrar la anterior— gana el que empieza más tarde, que
+        es el que se cargó después.
+        """
+        df = self.get_df("Turnos")
+        if df.empty or "ID_Empleado" not in df.columns:
+            return None
+        f = self._a_fecha(fecha)
+        if not f:
+            return None
+        candidatos = []
+        for _, r in df.iterrows():
+            if str(r.get("ID_Empleado", "")).strip() != str(id_empleado).strip():
+                continue
+            d0, d1 = self._a_fecha(r.get("Fecha_Desde")), self._a_fecha(r.get("Fecha_Fin"))
+            if not d0:
+                continue
+            if f < d0 or (d1 and f > d1):
+                continue
+            candidatos.append((d0, str(r.get("ID_Horario", "")).strip()))
+        if not candidatos:
+            return None
+        candidatos.sort(key=lambda x: x[0])
+        return self.horario_por_id(candidatos[-1][1])
+
+    def horario_de_area(self, area: str) -> dict | None:
+        df = self.get_df("Horarios_Area")
+        if df.empty or "Area" not in df.columns or not str(area).strip():
+            return None
+        m = df[df["Area"].astype(str).str.strip().str.lower()
+               == str(area).strip().lower()]
+        if m.empty:
+            return None
+        return self.horario_por_id(str(m.iloc[-1].get("ID_Horario", "")).strip())
+
+    def horario_de(self, empleado, fecha=None, config: dict | None = None) -> dict:
+        """Horario que le aplica a esa persona ese día, y de dónde salió.
+
+        El orden va de lo más específico a lo más general. Nunca devuelve None:
+        si no hay nada asignado, rige el horario general de la empresa, que es
+        el comportamiento que existía antes de que hubiera catálogo.
+        """
+        if isinstance(empleado, str):
+            empleado = self.get_empleado(empleado) or {}
+        emp_id = str(empleado.get("ID_Empleado", "") or "").strip()
+        fecha = fecha or hoy_local(config)
+
+        if emp_id:
+            h = self.turno_vigente(emp_id, fecha)
+            if h:
+                h["origen"] = ORIGEN_TURNO
+                return h
+
+        propio = str(empleado.get("ID_Horario", "") or "").strip()
+        if propio:
+            h = self.horario_por_id(propio)
+            if h:
+                h["origen"] = ORIGEN_FICHA
+                return h
+
+        h = self.horario_de_area(str(empleado.get("Area", "") or ""))
+        if h:
+            h["origen"] = ORIGEN_AREA
+            return h
+
+        return self.horario_global(config)
+
+    def minutos_de_atraso(self, hora, config: dict, horario: dict | None = None) -> int:
         """Minutos de atraso que generaría marcar la entrada a esa hora.
 
         Se calcula igual que registrar_entrada, para poder advertirle a la
@@ -1042,8 +1195,9 @@ class SheetsManager:
         expediente.
         """
         try:
-            inicio = str(config.get("Horario_Inicio", "09:00"))[:5]
-            tol = int(float(config.get("Tolerancia_Minutos", 0) or 0))
+            h = horario or self.horario_global(config)
+            inicio = str(h["entrada"])[:5]
+            tol = int(h.get("tolerancia_entrada", 0) or 0)
             fmt = "%H:%M"
             d = (datetime.strptime(str(hora)[:5], fmt)
                  - datetime.strptime(inicio, fmt)).total_seconds() / 60
@@ -1088,7 +1242,8 @@ class SheetsManager:
                     "hora": str(r.get("Hora_Entrada", "") or "").strip(),
                     "nueva": False}
 
-        minutos_atraso = self.minutos_de_atraso(hora_entrada, config)
+        h = self.horario_de(id_empleado, fecha, config)
+        minutos_atraso = self.minutos_de_atraso(hora_entrada, config, h)
         estado = "Tardanza" if minutos_atraso > 0 else "A_Tiempo"
 
         cols = HEADERS["Asistencia"]
@@ -1118,7 +1273,7 @@ class SheetsManager:
             # duplicado, si lo hubo, lo recoge la pantalla de RRHH.
             pass
         return {"estado": estado, "minutos_atraso": int(minutos_atraso),
-                "hora": hora_entrada, "nueva": True}
+                "hora": hora_entrada, "nueva": True, "horario": h}
 
     def asistencia_fresca(self) -> pd.DataFrame:
         """Lee SOLO la hoja de Asistencia, sin caché, y falla si no puede.
@@ -1242,7 +1397,10 @@ class SheetsManager:
         self.update_campos("Asistencia", row_idx, campos)
 
         permiso = self.tiene_permiso_vigente(id_empleado, fecha)
-        return self.evaluar_salida(hora_salida, config or {}, permiso)
+        h = self.horario_de(id_empleado, fecha, config)
+        ev = self.evaluar_salida(hora_salida, config or {}, permiso, h)
+        ev["horario"] = h
+        return ev
 
     def tiene_permiso_vigente(self, id_empleado: str, fecha: str) -> dict | None:
         """Devuelve el permiso aprobado o en trámite del empleado en esa fecha.
@@ -1270,14 +1428,15 @@ class SheetsManager:
         return None
 
     def evaluar_salida(self, hora_salida: str, config: dict,
-                       permiso: dict | None = None) -> dict:
+                       permiso: dict | None = None, horario: dict | None = None) -> dict:
         """Compara la hora de salida contra el horario de fin.
 
         Solo interesa la salida anticipada. Salir más tarde del horario no
         produce atraso ni hora extra: se registra la hora y nada más.
         """
-        horario_fin = str(config.get("Horario_Fin", "17:30"))[:5]
-        tolerancia = int(self._a_numero(config.get("Tolerancia_Salida_Minutos"), 0))
+        h = horario or self.horario_global(config)
+        horario_fin = str(h["salida"])[:5]
+        tolerancia = int(h.get("tolerancia_salida", 0) or 0)
         try:
             fin = datetime.strptime(horario_fin, "%H:%M")
             sal = datetime.strptime(str(hora_salida)[:5], "%H:%M")
@@ -1446,6 +1605,85 @@ class SheetsManager:
     def get_vacaciones(self) -> pd.DataFrame:
         return self.get_df("Vacaciones")
 
+    def guardar_horario(self, id_horario, nombre, entrada, salida,
+                        tol_entrada=0, tol_salida=0, horas_almuerzo=0,
+                        activo=True, observaciones="") -> str:
+        """Crea o actualiza un horario del catálogo."""
+        cols = HEADERS["Horarios"]
+        ident = str(id_horario or "").strip() or self._siguiente_id(
+            "Horarios", "ID_Horario", "H")
+        fila = [""] * len(cols)
+        for c, v in (("ID_Horario", ident), ("Nombre", nombre),
+                     ("Entrada", str(entrada)[:5]), ("Salida", str(salida)[:5]),
+                     ("Tolerancia_Entrada", int(tol_entrada)),
+                     ("Tolerancia_Salida", int(tol_salida)),
+                     ("Horas_Almuerzo", horas_almuerzo),
+                     ("Activo", "Sí" if activo else "No"),
+                     ("Observaciones", observaciones)):
+            fila[cols.index(c)] = v
+        df = self.get_horarios()
+        m = (df[df["ID_Horario"].astype(str).str.strip() == ident]
+             if not df.empty and "ID_Horario" in df.columns else df.iloc[0:0])
+        if not m.empty:
+            self.update_row("Horarios", fila_de_hoja(df, m.index[-1]), fila)
+        else:
+            self.append("Horarios", fila)
+        return ident
+
+    def _siguiente_id(self, hoja: str, columna: str, prefijo: str) -> str:
+        """Siguiente identificador correlativo de una hoja."""
+        df = self.get_df(hoja)
+        n = 0
+        if not df.empty and columna in df.columns:
+            for v in df[columna].astype(str):
+                v = v.strip()
+                if v.startswith(prefijo) and v[len(prefijo):].isdigit():
+                    n = max(n, int(v[len(prefijo):]))
+        return f"{prefijo}{n + 1:03d}"
+
+    def asignar_horario_area(self, area: str, id_horario: str):
+        """Deja un solo horario por área: si ya había uno, se reemplaza."""
+        cols = HEADERS["Horarios_Area"]
+        fila = [""] * len(cols)
+        fila[cols.index("Area")] = str(area).strip()
+        fila[cols.index("ID_Horario")] = str(id_horario).strip()
+        df = self.get_df("Horarios_Area")
+        m = (df[df["Area"].astype(str).str.strip().str.lower()
+                == str(area).strip().lower()]
+             if not df.empty and "Area" in df.columns else df.iloc[0:0])
+        if not m.empty:
+            self.update_row("Horarios_Area", fila_de_hoja(df, m.index[-1]), fila)
+        else:
+            self.append("Horarios_Area", fila)
+
+    def asignar_turno(self, id_empleado, fecha_desde, fecha_fin, id_horario,
+                      registrado_por="", observaciones="") -> str:
+        """Asigna un turno con fechas. Es lo que manda sobre todo lo demás."""
+        cols = HEADERS["Turnos"]
+        ident = self._siguiente_id("Turnos", "ID_Turno", "T")
+        fila = [""] * len(cols)
+        for c, v in (("ID_Turno", ident), ("ID_Empleado", str(id_empleado).strip()),
+                     ("Fecha_Desde", str(fecha_desde)), ("Fecha_Fin", str(fecha_fin)),
+                     ("ID_Horario", str(id_horario).strip()),
+                     ("Registrado_Por", registrado_por),
+                     ("Observaciones", observaciones)):
+            fila[cols.index(c)] = v
+        self.append("Turnos", fila)
+        return ident
+
+    def borrar_turno(self, id_turno: str):
+        """Vacía la fila del turno en vez de eliminarla, para no correr filas."""
+        df = self.get_df("Turnos")
+        if df.empty or "ID_Turno" not in df.columns:
+            return
+        m = df[df["ID_Turno"].astype(str).str.strip() == str(id_turno).strip()]
+        if m.empty:
+            return
+        n = fila_de_hoja(df, m.index[0])
+        con_reintentos(self._sheet("Turnos").batch_clear,
+                       [f"A{n}:{rowcol_to_a1(n, len(HEADERS['Turnos']))}"])
+        self._invalidar_cache("Turnos")
+
     # ── Panel semanal ────────────────────────────────────────────────────────
 
     def feriados(self, config: dict | None = None) -> set:
@@ -1576,7 +1814,16 @@ class SheetsManager:
             sin_salida     = [d for d, m in mias.items() if m["entrada"] and not m["salida"]]
             atrasos        = [d for d, m in mias.items() if m["estado"] == "Tardanza"]
             ausencias      = [d for d, m in mias.items() if m["estado"] == "Ausente"]
-            horas = sum(self._horas_entre(m["entrada"], m["salida"]) for m in mias.values())
+            # El almuerzo se descuenta de cada jornada cerrada. Es flexible —no
+            # se marca— así que se resta el número de horas del horario, no una
+            # ventana fija.
+            hor = self.horario_de(emp, d1, config)
+            almuerzo = float(hor.get("horas_almuerzo", 0) or 0)
+            horas = 0.0
+            for m in mias.values():
+                bruto = self._horas_entre(m["entrada"], m["salida"])
+                if bruto:
+                    horas += max(0.0, bruto - almuerzo)
 
             # Día de oficina: solo aplica a quien tiene uno pactado. El sistema
             # sabe si HUBO MARCA ese día, no si la persona estuvo en la oficina.
@@ -1594,6 +1841,10 @@ class SheetsManager:
                 "area": str(emp.get("Area", "") or "").strip(),
                 "modalidad": mod,
                 "dia_oficina": dia_of,
+                "horario": hor["nombre"],
+                "horario_origen": hor["origen"],
+                "jornada": f"{hor['entrada']}–{hor['salida']}",
+                "horas_almuerzo": almuerzo,
                 "dias_esperados": len(esperados),
                 "dias_marcados": len(dias_con_marca),
                 "dias_sin_marca": sorted(sin_marca),

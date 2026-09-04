@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 import html as _html
 import sheets_manager as SM
 from sheets_manager import (
-    SheetsManager, CONFIG_DEFAULTS, ahora_local, hoy_local,
+    SheetsManager, CONFIG_DEFAULTS, ahora_local, hoy_local, serie_fechas,
     es_error_transitorio, leer_formulario_kye,
     EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO, TIPO_TARDANZA,
     CAUSALES_LLAMADO, GRAVEDAD_CAUSAL, TIPOS_RECONOCIMIENTO,
@@ -1090,11 +1090,15 @@ def page_dashboard():
         return
 
     total_emp = len(emp_df)
-    asis_hoy  = len(asis_df[asis_df["Fecha"].astype(str) == hoy_str]) if not asis_df.empty else 0
-    tardanzas_mes = len(asis_df[
-        (asis_df["Fecha"].astype(str).str.startswith(mes)) &
-        (asis_df["Estado"].astype(str) == "Tardanza")
-    ]) if not asis_df.empty else 0
+    # Las fechas se comparan interpretadas, no como texto: la hoja puede
+    # devolver 4/9/2026 y ese texto no es igual a "2026-09-04" ni empieza
+    # con "2026-09", aunque sea exactamente el mismo día.
+    _fa = serie_fechas(asis_df["Fecha"]) if not asis_df.empty else None
+    asis_hoy = int(_fa.map(lambda f: str(f) == hoy_str).sum()) if _fa is not None else 0
+    tardanzas_mes = int((
+        _fa.map(lambda f: bool(f) and f.strftime("%Y-%m") == mes)
+        & (asis_df["Estado"].astype(str) == "Tardanza")
+    ).sum()) if _fa is not None else 0
     pend_permisos = len(perm_df[perm_df["Estado"].astype(str).str.lower() == "pendiente_aprobacion"]) if not perm_df.empty else 0
     pend_vac = len(vac_df[vac_df["Estado"].astype(str).str.lower() == "pendiente"]) if not vac_df.empty else 0
 
@@ -1141,9 +1145,12 @@ def page_dashboard():
     # Gráfico de asistencia mensual
     if not asis_df.empty and "Fecha" in asis_df.columns:
         st.subheader("📈 Asistencia del mes")
-        asis_mes = asis_df[asis_df["Fecha"].astype(str).str.startswith(mes)].copy()
+        # Se compara por fecha interpretada, no por cómo empieza el texto: la
+        # hoja puede devolver 1/9/2026 y ese texto no empieza con "2026-09".
+        _f = serie_fechas(asis_df["Fecha"])
+        asis_mes = asis_df[_f.map(lambda f: bool(f) and f.strftime("%Y-%m") == mes)].copy()
         if not asis_mes.empty:
-            asis_mes["Fecha"] = pd.to_datetime(asis_mes["Fecha"])
+            asis_mes["Fecha"] = _f[asis_mes.index].map(lambda f: f.strftime("%Y-%m-%d"))
             chart_data = asis_mes.groupby(["Fecha","Estado"]).size().unstack(fill_value=0)
             st.bar_chart(chart_data)
 
@@ -1690,16 +1697,18 @@ def page_asistencia():
         st.subheader("Historial de asistencia")
         c1, c2 = st.columns(2)
         with c1:
-            fecha_desde = st.date_input("Desde", hoy().replace(day=1))
+            fecha_desde = st.date_input("Desde", hoy().replace(day=1), key="hist_desde")
         with c2:
-            fecha_hasta = st.date_input("Hasta", hoy())
+            fecha_hasta = st.date_input("Hasta", hoy(), key="hist_hasta")
 
         df_asis = sm.get_df("Asistencia")
         if not df_asis.empty:
-            df_asis["Fecha"] = pd.to_datetime(df_asis["Fecha"], errors="coerce")
-            mask = (df_asis["Fecha"].dt.date >= fecha_desde) & (df_asis["Fecha"].dt.date <= fecha_hasta)
+            # Mismo criterio de lectura que el resto del sistema: día/mes/año.
+            fechas = serie_fechas(df_asis["Fecha"])
+            ilegibles = int(fechas.isna().sum())
+            mask = fechas.map(lambda f: bool(f) and fecha_desde <= f <= fecha_hasta)
             df_filtro = df_asis[mask].copy()
-            df_filtro["Fecha"] = df_filtro["Fecha"].dt.strftime("%Y-%m-%d")
+            df_filtro["Fecha"] = fechas[mask].map(lambda f: f.strftime("%Y-%m-%d"))
 
             # Empleados solo ven su propio historial
             if not admin and usuario:
@@ -1713,6 +1722,29 @@ def page_asistencia():
 
             if df_filtro.empty:
                 st.info("Sin registros en el período seleccionado.")
+                # La hoja tiene filas pero ninguna cae en el rango. Antes esto
+                # se veía igual que "no hay nada"; mostrar las fechas reales
+                # evita tener que adivinar cuál de las dos cosas pasó.
+                with st.expander("🔍 Qué hay realmente en la hoja"):
+                    st.write(f"La hoja Asistencia tiene **{len(df_asis)} fila(s)** en total.")
+                    if ilegibles:
+                        st.warning(f"⚠️ {ilegibles} fila(s) tienen una fecha que no se "
+                                   "pudo interpretar. Revisa la columna Fecha en la "
+                                   "hoja de cálculo.")
+                    leidas = [f for f in fechas if f]
+                    if leidas:
+                        st.write(f"Van del **{min(leidas):%d/%m/%Y}** al "
+                                 f"**{max(leidas):%d/%m/%Y}**.")
+                    st.caption("Últimos registros, tal como están escritos en la hoja "
+                               "y cómo los interpreta el sistema:")
+                    ult = df_asis.tail(10)
+                    st.dataframe(tabla_segura(pd.DataFrame({
+                        "Fecha en la hoja": ult["Fecha"].astype(str).values,
+                        "Interpretada como": [f.strftime("%Y-%m-%d") if f else "❌ ilegible"
+                                              for f in fechas[ult.index]],
+                        "Empleado": ult.get("Nombre", pd.Series([""] * len(ult))).astype(str).values,
+                        "Entrada": ult.get("Hora_Entrada", pd.Series([""] * len(ult))).astype(str).values,
+                    })), use_container_width=True, hide_index=True)
             else:
                 st.dataframe(tabla_segura(df_filtro), use_container_width=True, hide_index=True)
                 st.caption(f"{len(df_filtro)} registro(s)")

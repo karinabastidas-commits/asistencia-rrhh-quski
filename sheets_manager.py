@@ -26,6 +26,17 @@ _CACHE_TTL = 90
 FILA_HOJA = "_fila_hoja"
 
 
+def serie_fechas(serie):
+    """Convierte una columna de fechas de la hoja a objetos date.
+
+    Usa el mismo criterio que el resto del sistema —día/mes/año primero, que es
+    como se escribe en Ecuador— en vez del de pandas, que asume mes/día/año y
+    convierte el 1 de septiembre en 9 de enero. Lo que no se puede interpretar
+    queda como None, nunca como una fecha inventada.
+    """
+    return serie.map(SheetsManager._a_fecha)
+
+
 def fila_de_hoja(df, idx) -> int:
     """Número de fila en la hoja para una fila del DataFrame.
 

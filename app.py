@@ -12,6 +12,7 @@ import html as _html
 import sheets_manager as SM
 from sheets_manager import (
     SheetsManager, CONFIG_DEFAULTS, ahora_local, hoy_local, serie_fechas,
+    LecturaNoConfiable,
     es_error_transitorio, leer_formulario_kye,
     EST_PEND_JEFE, EST_PEND_RRHH, EST_APROBADO, EST_RECHAZADO, TIPO_TARDANZA,
     CAUSALES_LLAMADO, GRAVEDAD_CAUSAL, TIPOS_RECONOCIMIENTO,
@@ -293,23 +294,41 @@ def registrar_entrada_automatica():
                           "Si hoy trabajaste y falta tu marca, pídele a RRHH que la registre.")
         return
 
+    # Candado de sesión: la pantalla se redibuja muchas veces por minuto y no
+    # tiene sentido volver a consultar Google en cada redibujo. Una vez que
+    # esta sesión sabe que la entrada del día está puesta, no vuelve a mirar.
+    candado = f"entrada_lista_{fecha_hoy}"
+    if st.session_state.get(candado):
+        return
+
     try:
-        # La comprobación se hace SIN caché: la marca pudo hacerla la misma
-        # persona hace un minuto desde el celular, y la lectura guardada no la
-        # traería todavía.
-        if sm.entrada_de(emp_id, fecha_hoy, usar_cache=False):
-            return
-        estado, atraso = sm.registrar_entrada(
+        d = sm.registrar_entrada_detalle(
             emp_id, str(emp.get("Nombre", emp_id)),
             momento.strftime("%H:%M"), config, tipo_dispositivo())
+        st.session_state[candado] = True
+        estado, atraso = d["estado"], d["minutos_atraso"]
+        if not d["nueva"]:
+            # Ya tenía marca: no se avisa nada. Anunciar un registro que no
+            # ocurrió, y con la hora equivocada, es peor que no decir nada.
+            return
+        verbo = genero_de(sm, emp_id)
         if estado == "Tardanza":
-            flash("warning", f"⏰ Tu entrada quedó registrada a las "
-                             f"{momento.strftime('%H:%M')} — {atraso} minuto(s) de atraso.")
+            flash("aviso_grande", ("atraso", f"{verbo} CON ATRASO",
+                                   f"Entrada a las {d['hora']} — {atraso} minuto(s) "
+                                   "después de tu horario."))
             notificar_tardanza(sm, st.session_state.config, emp_id,
                                str(emp.get("Nombre", emp_id)), momento, atraso)
         else:
-            flash("success", f"✅ Tu entrada quedó registrada a las "
-                             f"{momento.strftime('%H:%M')}. ¡Buen día!")
+            flash("aviso_grande", ("bien", f"{verbo} A TIEMPO",
+                                   f"Entrada a las {d['hora']}. ¡Que tengas buen día!"))
+    except LecturaNoConfiable:
+        # No se pudo leer la hoja, así que no se sabe si ya tenía marca. No se
+        # escribe nada: una entrada de más queda para siempre en su expediente,
+        # y volver a intentarlo en la próxima recarga no cuesta nada.
+        flash("warning", "⚠️ No se pudo consultar la hoja de asistencia en este "
+                         "momento (Google está limitando las consultas). Tu "
+                         "entrada NO se registró todavía; vuelve a cargar la "
+                         "página en un minuto.")
     except Exception as e:
         flash("warning", f"No se pudo registrar tu entrada automáticamente ({e}). "
                          "Márcala desde el módulo de Asistencia.")
@@ -362,6 +381,61 @@ def tabla_segura(df):
     return out
 
 
+# Los tres desenlaces posibles de una marca. El color y la cara son lo primero
+# que se ve; el texto de abajo explica el porqué.
+CARAS = {
+    "bien":    ("😊", "#12833B", "#E7F6EC"),   # a tiempo
+    "atraso":  ("😢", "#B42318", "#FEECEB"),   # llegó tarde
+    "temprano":("😬", "#B54708", "#FEF3E2"),   # salió antes de hora
+}
+
+
+def aviso_grande(clase: str, titulo: str, detalle: str = ""):
+    """Confirmación en letras grandes, con color y carita.
+
+    Se dibuja con HTML porque los avisos normales de Streamlit tienen un tamaño
+    fijo pensado para leerse de cerca. Aquí hace falta lo contrario: que se lea
+    de un vistazo, en el celular y con la fila esperando.
+    """
+    cara, color, fondo = CARAS.get(clase, CARAS["bien"])
+    st.markdown(
+        f"""<div style="background:{fondo};border:2px solid {color};
+                    border-radius:14px;padding:1.1rem 1.3rem;margin:.6rem 0;
+                    display:flex;align-items:center;gap:1rem;">
+              <div style="font-size:3.2rem;line-height:1;">{cara}</div>
+              <div style="min-width:0;">
+                <div style="color:{color};font-size:2rem;font-weight:800;
+                            line-height:1.15;letter-spacing:.5px;">{esc(titulo)}</div>
+                {f'<div style="color:{color};font-size:1.05rem;margin-top:.25rem;">{esc(detalle)}</div>' if detalle else ''}
+              </div>
+            </div>""",
+        unsafe_allow_html=True)
+
+
+def genero_de(sm, emp_id: str) -> str:
+    """«REGISTRADA» o «REGISTRADO», según la ficha KYE de la persona.
+
+    Sale de la caché que ya trajo el resto de las hojas, así que no cuesta una
+    llamada más. Si no hay ficha o no está el dato, se usa la forma neutra:
+    inventar el género de alguien es peor que no decirlo.
+    """
+    try:
+        df = sm.get_df("KYE_Empleado")
+        if df.empty or "Sexo" not in df.columns:
+            return "REGISTRADO/A"
+        m = df[df["ID_Empleado"].astype(str).str.strip() == str(emp_id).strip()]
+        if m.empty:
+            return "REGISTRADO/A"
+        sexo = str(m.iloc[-1].get("Sexo", "") or "").strip().lower()
+    except Exception:
+        return "REGISTRADO/A"
+    if sexo.startswith("f"):
+        return "REGISTRADA"
+    if sexo.startswith("m"):
+        return "REGISTRADO"
+    return "REGISTRADO/A"
+
+
 def flash(tipo: str, mensaje: str):
     """Guarda un mensaje para mostrarlo DESPUÉS del st.rerun().
 
@@ -374,7 +448,12 @@ def flash(tipo: str, mensaje: str):
 def mostrar_flash():
     """Pinta arriba de la página los mensajes dejados antes de la recarga."""
     for tipo, mensaje in st.session_state.pop("flash", []):
-        getattr(st, tipo, st.info)(mensaje)
+        if tipo == "aviso_grande":
+            # El mensaje viene como (clase, título, detalle)
+            clase, titulo, detalle = mensaje
+            aviso_grande(clase, titulo, detalle)
+        else:
+            getattr(st, tipo, st.info)(mensaje)
 
 
 def sin_datos(mensaje: str, tipo: str = "info"):
@@ -1563,19 +1642,37 @@ def page_asistencia():
                 if st.button("📌 Registrar mi entrada ahora", type="primary",
                              disabled=not confirmado):
                     momento = ahora()
-                    with st.spinner("Registrando…"):
-                        estado, atraso = sm.registrar_entrada(
-                            emp_id, nombre, momento.strftime("%H:%M"), config,
-                            tipo_dispositivo())
-                    if estado == "Tardanza":
-                        flash("warning", f"⏰ Entrada de **{nombre}** registrada a las "
-                                         f"{momento.strftime('%H:%M')} — "
-                                         f"**{atraso} minuto(s)** de atraso.")
-                        notificar_tardanza(sm, config, emp_id, nombre, momento, atraso)
-                    else:
-                        flash("success", f"✅ Entrada de **{nombre}** registrada a tiempo, "
-                                         f"a las {momento.strftime('%H:%M')}.")
-                    st.rerun()
+                    d = None
+                    try:
+                        with st.spinner("Registrando…"):
+                            d = sm.registrar_entrada_detalle(
+                                emp_id, nombre, momento.strftime("%H:%M"), config,
+                                tipo_dispositivo())
+                    except LecturaNoConfiable:
+                        # No se pudo comprobar si ya tenía marca, así que no se
+                        # escribió nada. Se avisa y se deja la pantalla como
+                        # está: cortar el dibujo aquí la dejaría a medias.
+                        st.error("⚠️ No se pudo consultar la hoja para comprobar si "
+                                 f"**{nombre}** ya tenía entrada hoy, así que **no se "
+                                 "registró nada**. Google está limitando las consultas: "
+                                 "espera un minuto y vuelve a intentar.")
+                    if d is not None:
+                        if not d["nueva"]:
+                            flash("info", f"ℹ️ **{nombre}** ya tenía su entrada de hoy "
+                                          f"registrada a las **{d['hora']}**. No se "
+                                          "creó un segundo registro.")
+                        elif d["estado"] == "Tardanza":
+                            flash("aviso_grande",
+                                  ("atraso", f"{genero_de(sm, emp_id)} CON ATRASO",
+                                   f"{nombre} — entrada a las {d['hora']}, "
+                                   f"{d['minutos_atraso']} minuto(s) de atraso."))
+                            notificar_tardanza(sm, config, emp_id, nombre, momento,
+                                               d["minutos_atraso"])
+                        else:
+                            flash("aviso_grande",
+                                  ("bien", f"{genero_de(sm, emp_id)} A TIEMPO",
+                                   f"{nombre} — entrada a las {d['hora']}."))
+                        st.rerun()
 
     if tab2.activo:
         st.subheader(f"Registrar salida – {hoy().strftime('%d/%m/%Y')}")
@@ -1608,21 +1705,33 @@ def page_asistencia():
                     # Explícito: la sección se conserva para que nadie lea la
                     # recarga como si le hubieran registrado una entrada.
                     st.session_state["sec_asistencia"] = ET_SAL
-                    flash("success", f"✅ Salida de **{nombre}** registrada a las "
-                                     f"{momento.strftime('%H:%M')}. Tu jornada de hoy "
-                                     f"quedó cerrada.")
+                    verbo = genero_de(sm, emp_id)
+                    hora_sal = momento.strftime("%H:%M")
                     if ev["anticipada"]:
-                        flash("warning", f"⏱️ Salida **{ev['minutos_antes']} minuto(s) "
-                                         f"antes** del horario ({ev['horario_fin']}). "
-                                         "Se avisó a tu jefe inmediato.")
+                        # Salió antes de hora y sin permiso: se registra igual,
+                        # pero el aviso no puede parecer una felicitación.
+                        flash("aviso_grande",
+                              ("temprano", f"{verbo} ANTES DE HORA",
+                               f"Salida a las {hora_sal} — {ev['minutos_antes']} "
+                               f"minuto(s) antes de las {ev['horario_fin']}. "
+                               "Se avisó a tu jefe inmediato."))
                         notificar_salida_anticipada(sm, config, emp_id, nombre, ev, obs)
-                    elif ev.get("permiso") and ev["minutos_antes"] > 0:
-                        # Salió antes pero tenía permiso: no es salida anticipada.
-                        pm = ev["permiso"]
-                        flash("info", f"ℹ️ Saliste {ev['minutos_antes']} minuto(s) antes, "
-                                      f"amparado por el permiso **{pm['id']}** "
-                                      f"({pm['horas']}h). No se registró como salida "
-                                      "anticipada ni se avisó a tu jefe.")
+                    else:
+                        # A la hora o después: en ambos casos la jornada quedó
+                        # completa, y salir más tarde no genera atraso.
+                        flash("aviso_grande",
+                              ("bien", f"{verbo} — JORNADA CERRADA",
+                               f"{nombre} — salida a las {hora_sal}. "
+                               "¡Hasta mañana!"))
+                        if ev.get("permiso") and ev["minutos_antes"] > 0:
+                            # Salió antes pero tenía permiso: no es salida
+                            # anticipada, así que el aviso grande va en verde y
+                            # aquí solo se deja constancia de bajo qué permiso.
+                            pm = ev["permiso"]
+                            flash("info", f"ℹ️ Saliste {ev['minutos_antes']} minuto(s) antes, "
+                                          f"amparado por el permiso **{pm['id']}** "
+                                          f"({pm['horas']}h). No se registró como salida "
+                                          "anticipada ni se avisó a tu jefe.")
                     st.rerun()
                 except ValueError as e:
                     st.error(str(e))

@@ -69,6 +69,15 @@ _ERRORES_CUOTA = ("429", "quota exceeded", "rate_limit", "resource_exhausted",
                   "too many requests")
 
 
+class LecturaNoConfiable(Exception):
+    """No se pudo leer la hoja, así que no se sabe qué hay en ella.
+
+    Existe para separar «leí y no hay nada» de «no pude leer». Confundir las
+    dos es lo que producía entradas duplicadas: ante un error de cuota el
+    sistema veía una hoja vacía y concluía que la persona no había marcado.
+    """
+
+
 def es_error_cuota(e) -> bool:
     """True si Google rechazó la llamada por exceso de consultas."""
     texto = f"{type(e).__name__}: {e}".lower()
@@ -1044,7 +1053,19 @@ class SheetsManager:
 
     def registrar_entrada(self, id_empleado: str, nombre: str, hora_entrada: str,
                           config: dict, dispositivo: str = "") -> tuple:
+        """Igual que registrar_entrada_detalle, devolviendo (estado, atraso)."""
+        d = self.registrar_entrada_detalle(id_empleado, nombre, hora_entrada,
+                                           config, dispositivo)
+        return d["estado"], d["minutos_atraso"]
+
+    def registrar_entrada_detalle(self, id_empleado: str, nombre: str, hora_entrada: str,
+                                  config: dict, dispositivo: str = "") -> dict:
         """Registra la hora de entrada, una sola vez al día.
+
+        Devuelve además si esta llamada fue la que ESCRIBIÓ la marca ("nueva")
+        y a qué hora quedó. Sin ese dato la pantalla anunciaba "tu entrada
+        quedó registrada a las 10:15" a alguien que en realidad había marcado
+        a las 08:52 desde el celular.
 
         Devuelve (estado, minutos_atraso). Si la persona YA tiene entrada hoy,
         no escribe nada y devuelve la que ya existía: la defensa contra el
@@ -1054,12 +1075,18 @@ class SheetsManager:
         """
         fecha = hoy_local(config).strftime("%Y-%m-%d")
 
-        # Relectura SIN caché justo antes de escribir. Es una llamada más a
-        # Google, y vale la pena: evita el registro doble, que ensucia el
-        # expediente disciplinario de la persona.
-        previa = self.entrada_de(id_empleado, fecha, usar_cache=False)
-        if previa:
-            return previa["estado"] or "A_Tiempo", int(previa["minutos_atraso"] or 0)
+        # Relectura de la hoja justo antes de escribir. Si Google no responde,
+        # esto LEVANTA en vez de devolver vacío: no saber si ya marcó no es lo
+        # mismo que saber que no marcó, y escribir en la duda es exactamente lo
+        # que llenaba la hoja de filas repetidas.
+        df = self.asistencia_fresca()
+        previas = self._marcas_del_dia(df, id_empleado, fecha)
+        if not previas.empty:
+            r = previas.iloc[0]
+            return {"estado": str(r.get("Estado", "") or "").strip() or "A_Tiempo",
+                    "minutos_atraso": int(self._a_numero(r.get("Minutos_Atraso"), 0)),
+                    "hora": str(r.get("Hora_Entrada", "") or "").strip(),
+                    "nueva": False}
 
         minutos_atraso = self.minutos_de_atraso(hora_entrada, config)
         estado = "Tardanza" if minutos_atraso > 0 else "A_Tiempo"
@@ -1073,7 +1100,53 @@ class SheetsManager:
                                   ("Dispositivo_Entrada", dispositivo)):
             fila[cols.index(nombre_col)] = valor
         self.append("Asistencia", fila)
-        return estado, int(minutos_atraso)
+
+        # Dos pestañas abiertas pueden pasar la comprobación de arriba en el
+        # mismo instante y escribir las dos. Se vuelve a mirar y, si quedó más
+        # de una fila, se conserva la de MENOR número de fila y se limpian las
+        # demás. La regla es determinista a propósito: dos sesiones que la
+        # apliquen a la vez llegan al mismo resultado en vez de pisarse.
+        try:
+            repetidas = self._marcas_del_dia(
+                self.asistencia_fresca(), id_empleado, fecha)
+            if len(repetidas) > 1:
+                filas = sorted(fila_de_hoja(repetidas, i) for i in repetidas.index)
+                for n in filas[1:]:
+                    self.limpiar_entrada_duplicada(n)
+        except Exception:
+            # Si la verificación falla, la entrada ya quedó registrada; el
+            # duplicado, si lo hubo, lo recoge la pantalla de RRHH.
+            pass
+        return {"estado": estado, "minutos_atraso": int(minutos_atraso),
+                "hora": hora_entrada, "nueva": True}
+
+    def asistencia_fresca(self) -> pd.DataFrame:
+        """Lee SOLO la hoja de Asistencia, sin caché, y falla si no puede.
+
+        Pide una hoja en vez de las catorce: antes de escribir hace falta el
+        dato al día, y traer todo el libro para eso es justo lo que agotaba la
+        cuota en la hora de entrada. Si Google no responde, levanta
+        LecturaNoConfiable en lugar de devolver una hoja vacía.
+        """
+        try:
+            valores = con_reintentos(self._sheet("Asistencia").get_all_values)
+        except Exception as e:
+            self.ultimo_error = f"{type(e).__name__}: {e}"
+            raise LecturaNoConfiable(self.ultimo_error) from e
+        df = self._df_desde_valores("Asistencia", valores)
+        self._cache["Asistencia"] = (time.time(), df)
+        self.ultimo_error = None
+        return df
+
+    def _marcas_del_dia(self, df, id_empleado: str, fecha: str):
+        """Filas de esa persona ese día que ya tienen hora de entrada."""
+        if df.empty or "ID_Empleado" not in df.columns:
+            return df.iloc[0:0]
+        m = df[(df["Fecha"].astype(str).str.strip() == str(fecha).strip())
+               & (df["ID_Empleado"].astype(str).str.strip() == str(id_empleado).strip())]
+        if "Hora_Entrada" in m.columns:
+            m = m[m["Hora_Entrada"].astype(str).str.strip() != ""]
+        return m
 
     def entrada_de(self, id_empleado: str, fecha: str, usar_cache: bool = True) -> dict | None:
         """El registro de asistencia de esa persona ese día, si existe."""

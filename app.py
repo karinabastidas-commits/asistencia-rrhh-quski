@@ -9,6 +9,7 @@ import pandas as pd
 import json
 from datetime import date, datetime, timedelta
 import html as _html
+import sheets_manager as SM
 from sheets_manager import (
     SheetsManager, CONFIG_DEFAULTS, ahora_local, hoy_local,
     es_error_transitorio, leer_formulario_kye,
@@ -213,6 +214,43 @@ def dentro_de_ventana_entrada(momento, config) -> bool:
     return desde <= momento.time() <= hasta
 
 
+def tipo_dispositivo() -> str:
+    """Desde qué clase de equipo se está marcando: celular, tablet o computadora.
+
+    Sale del User-Agent que el navegador manda en cada petición. Es un dato
+    útil para auditoría —una marca hecha desde el celular no prueba que la
+    persona estuviera en la agencia— pero NO es una ubicación ni identifica al
+    aparato: solo dice qué tipo de equipo es. Si la versión de Streamlit no
+    expone las cabeceras, se devuelve vacío y todo lo demás sigue igual.
+    """
+    try:
+        ua = str(st.context.headers.get("User-Agent", ""))
+    except Exception:
+        return ""
+    if not ua:
+        return ""
+    u = ua.lower()
+    if "ipad" in u or ("android" in u and "mobile" not in u) or "tablet" in u:
+        clase = "Tablet"
+    elif ("mobi" in u or "iphone" in u or "android" in u or "windows phone" in u):
+        clase = "Celular"
+    else:
+        clase = "Computadora"
+    if "iphone" in u or "ipad" in u or "ipod" in u:
+        so = "iOS"
+    elif "android" in u:
+        so = "Android"
+    elif "windows" in u:
+        so = "Windows"
+    elif "mac os" in u or "macintosh" in u:
+        so = "macOS"
+    elif "linux" in u:
+        so = "Linux"
+    else:
+        so = ""
+    return f"{clase} ({so})" if so else clase
+
+
 def registrar_entrada_automatica():
     """Marca la entrada del empleado al iniciar sesión, una sola vez al día.
 
@@ -256,11 +294,14 @@ def registrar_entrada_automatica():
         return
 
     try:
-        if sm.ya_registro_entrada(emp_id, fecha_hoy):
+        # La comprobación se hace SIN caché: la marca pudo hacerla la misma
+        # persona hace un minuto desde el celular, y la lectura guardada no la
+        # traería todavía.
+        if sm.entrada_de(emp_id, fecha_hoy, usar_cache=False):
             return
         estado, atraso = sm.registrar_entrada(
             emp_id, str(emp.get("Nombre", emp_id)),
-            momento.strftime("%H:%M"), config)
+            momento.strftime("%H:%M"), config, tipo_dispositivo())
         if estado == "Tardanza":
             flash("warning", f"⏰ Tu entrada quedó registrada a las "
                              f"{momento.strftime('%H:%M')} — {atraso} minuto(s) de atraso.")
@@ -297,6 +338,11 @@ def tabla_segura(df):
     if df is None or getattr(df, "empty", True):
         return df
     out = df.copy()
+    # Las columnas internas (las que empiezan con guion bajo, como el número de
+    # fila de la hoja) son de uso del programa, no información para nadie.
+    internas = [c for c in out.columns if str(c).startswith("_")]
+    if internas:
+        out = out.drop(columns=internas)
     for col in out.columns:
         if out[col].dtype != object:
             continue
@@ -959,6 +1005,7 @@ def sidebar():
                 "🏠  Dashboard",
                 "👥  Empleados",
                 "✅  Asistencia",
+                "📅  Panel Semanal",
                 "📋  Permisos",
                 "🏖️  Vacaciones",
                 "⏰  Horas Extras",
@@ -1144,6 +1191,21 @@ def page_empleados():
                 hora_fin   = st.time_input("Horario de salida",  value=datetime.strptime("17:30", "%H:%M").time())
 
             st.divider()
+            st.caption("**Modalidad de trabajo** — de esto depende contra qué se "
+                       "compara su asistencia")
+            m1, m2 = st.columns(2)
+            with m1:
+                modalidad = st.selectbox(
+                    "Modalidad *", list(SM.MODALIDADES),
+                    help="Presencial: todos los días en oficina o fábrica. "
+                         "Teletrabajo: todos los días desde fuera. "
+                         "Mixto: teletrabajo con un día fijo de oficina.")
+            with m2:
+                dia_oficina = st.selectbox(
+                    "Día de oficina", [""] + SM.DIAS_SEMANA,
+                    help="Solo para modalidad Mixta: qué día le toca ir.")
+
+            st.divider()
             st.caption("**Vacaciones** — necesarios para calcular su saldo")
             v1, v2 = st.columns(2)
             with v1:
@@ -1166,7 +1228,9 @@ def page_empleados():
                         emp_id = sm.agregar_empleado(
                             nombre, email, area, email_jefe,
                             hora_ini.strftime("%H:%M"), hora_fin.strftime("%H:%M"),
-                            f_ingreso.strftime("%Y-%m-%d"), d_tomados
+                            f_ingreso.strftime("%Y-%m-%d"), d_tomados,
+                            modalidad,
+                            dia_oficina if modalidad == SM.MOD_MIXTO else ""
                         )
                     st.success(f"✅ Empleado creado: **{emp_id} – {nombre}**")
 
@@ -1194,6 +1258,22 @@ def page_empleados():
                     hora_fin = st.time_input("Salida",  fin_t)
 
                 st.divider()
+                st.caption("**Modalidad de trabajo**")
+                m1, m2 = st.columns(2)
+                mod_prev = sm.modalidad_de(emp)
+                dia_prev = str(emp.get("Dia_Oficina", "") or "").strip()
+                with m1:
+                    modalidad = st.selectbox(
+                        "Modalidad", list(SM.MODALIDADES),
+                        index=list(SM.MODALIDADES).index(mod_prev))
+                with m2:
+                    opciones_dia = [""] + SM.DIAS_SEMANA
+                    dia_oficina = st.selectbox(
+                        "Día de oficina", opciones_dia,
+                        index=opciones_dia.index(dia_prev) if dia_prev in opciones_dia else 0,
+                        help="Solo para modalidad Mixta.")
+
+                st.divider()
                 st.caption("**Vacaciones**")
                 v1, v2 = st.columns(2)
                 with v1:
@@ -1215,10 +1295,156 @@ def page_empleados():
                         sm.actualizar_empleado(
                             str(emp_id), nombre, email, area, email_jefe,
                             hora_ini.strftime("%H:%M"), hora_fin.strftime("%H:%M"),
-                            f_ingreso.strftime("%Y-%m-%d"), d_tomados
+                            f_ingreso.strftime("%Y-%m-%d"), d_tomados,
+                            modalidad,
+                            dia_oficina if modalidad == SM.MOD_MIXTO else ""
                         )
                     flash("success", "✅ Empleado actualizado")
                     st.rerun()
+
+
+# ── Módulo: Panel semanal ─────────────────────────────────────────────────────
+def _semana_de(d):
+    """Lunes y viernes de la semana en que cae la fecha."""
+    lunes = d - timedelta(days=d.weekday())
+    return lunes, lunes + timedelta(days=4)
+
+
+def page_panel_semanal():
+    """El equipo completo en una pantalla, leído contra lo que a cada uno le tocaba."""
+    sm = get_sm()
+    config = st.session_state.config
+    st.title("📅 Panel semanal")
+
+    hoy_d = hoy()
+    ref = st.session_state.get("panel_ref") or hoy_d
+
+    c1, c2, c3, c4 = st.columns([1, 1, 2, 1])
+    with c1:
+        if st.button("← Semana anterior"):
+            st.session_state["panel_ref"] = ref - timedelta(days=7)
+            st.rerun()
+    with c2:
+        if st.button("Semana siguiente →"):
+            st.session_state["panel_ref"] = ref + timedelta(days=7)
+            st.rerun()
+    with c4:
+        if st.button("Esta semana"):
+            st.session_state["panel_ref"] = hoy_d
+            st.rerun()
+
+    ini, fin = _semana_de(ref)
+    with c3:
+        st.markdown(f"### {ini.strftime('%d/%m')} al {fin.strftime('%d/%m/%Y')}")
+    if fin >= hoy_d >= ini:
+        st.caption("Semana en curso: los días que todavía no llegan no cuentan como falta.")
+        fin_efectivo = hoy_d
+    else:
+        fin_efectivo = fin
+
+    try:
+        datos = sm.resumen_periodo(ini, fin_efectivo, config)
+    except Exception as e:
+        st.error(f"No se pudo armar el panel: {type(e).__name__}: {e}")
+        return
+
+    if not datos:
+        sin_datos("No hay empleados para mostrar en este período.", "info")
+        return
+
+    # Lo que el panel sí puede afirmar, y lo que no. Decirlo aquí evita que un
+    # indicador verde se lea como prueba de presencia física.
+    st.info("El sistema registra **marcas**, no presencia. Un día marcado dice que "
+            "la persona entró al aplicativo y registró su hora, no dónde estaba. "
+            "Léelo como control de jornada, no de ubicación.")
+
+    total_sin_marca = sum(len(d["dias_sin_marca"]) for d in datos)
+    total_sin_salida = sum(len(d["sin_salida"]) for d in datos)
+    total_atrasos = sum(d["atrasos"] for d in datos)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Personas", len(datos))
+    k2.metric("Días sin marca", total_sin_marca)
+    k3.metric("Jornadas sin salida", total_sin_salida)
+    k4.metric("Atrasos", total_atrasos)
+
+    def semaforo(d):
+        """Verde, ámbar o rojo según lo que quedó pendiente esa semana."""
+        if d["dias_sin_marca"] or d["ausencias"]:
+            return "🔴"
+        if d["sin_salida"] or d["atrasos"] or d["oficina_cumplida"] is False:
+            return "🟡"
+        return "🟢"
+
+    filas = []
+    for d in datos:
+        if d["oficina_cumplida"] is None:
+            oficina = "—"
+        elif d["oficina_cumplida"]:
+            oficina = f"✅ {d['dia_oficina']}"
+        else:
+            oficina = f"❌ {d['dia_oficina']}"
+        filas.append({
+            "": semaforo(d),
+            "Nombre": d["nombre"],
+            "Modalidad": d["modalidad"],
+            "Marcados": f"{d['dias_marcados']}/{d['dias_esperados']}",
+            "Sin marca": len(d["dias_sin_marca"]),
+            "Atrasos": d["atrasos"],
+            "Min. atraso": d["minutos_atraso"],
+            "Sin salida": len(d["sin_salida"]),
+            "Horas": d["horas_declaradas"],
+            "Día oficina": oficina,
+            "Vacaciones": d["dias_vacaciones"],
+            "H. permiso": d["horas_permiso"],
+        })
+    st.dataframe(tabla_segura(pd.DataFrame(filas)),
+                 use_container_width=True, hide_index=True)
+    st.caption("🟢 sin pendientes · 🟡 atrasos, jornadas sin salida o día de "
+               "oficina no marcado · 🔴 días sin marca o ausencias")
+
+    st.divider()
+    st.subheader("Detalle por persona")
+    nombres = {f"{semaforo(d)} {d['nombre']}": d for d in datos}
+    elegido = st.selectbox("Persona", list(nombres.keys()), key="panel_persona")
+    d = nombres[elegido]
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Días marcados", f"{d['dias_marcados']}/{d['dias_esperados']}")
+    c2.metric("Horas declaradas", d["horas_declaradas"])
+    c3.metric("Minutos de atraso", d["minutos_atraso"])
+
+    if d["modalidad"] == SM.MOD_MIXTO and d["dia_oficina"]:
+        if d["oficina_cumplida"]:
+            st.success(f"✅ Marcó el {d['dia_oficina'].lower()}, su día de oficina.")
+        elif d["oficina_cumplida"] is False:
+            st.warning(f"⚠️ No marcó el {d['dia_oficina'].lower()}, su día de oficina.")
+    elif d["modalidad"] == SM.MOD_MIXTO:
+        st.caption("Modalidad mixta sin día de oficina definido: ponlo en la "
+                   "ficha del empleado para poder revisarlo.")
+
+    if d["dias_sin_marca"]:
+        st.error("**Días sin ninguna marca:** "
+                 + ", ".join(f.strftime("%a %d/%m") for f in d["dias_sin_marca"]))
+    if d["sin_salida"]:
+        st.warning("**Jornadas sin salida registrada:** "
+                   + ", ".join(f.strftime("%a %d/%m") for f in d["sin_salida"]))
+    if d["dispositivos"]:
+        st.caption("Marcó desde: " + " · ".join(d["dispositivos"])
+                   + ". Es el tipo de equipo, no una ubicación.")
+
+    if d["detalle"]:
+        st.dataframe(tabla_segura(pd.DataFrame([
+            {"Día": f.strftime("%A %d/%m"),
+             "Entrada": m["entrada"] or "—",
+             "Salida": m["salida"] or "—",
+             "Horas": sm._horas_entre(m["entrada"], m["salida"]) or "—",
+             "Estado": m["estado"] or "—",
+             "Atraso (min)": int(m["atraso"]),
+             "Equipo": m["dispositivo"] or "—"}
+            for f, m in d["detalle"].items()])),
+            use_container_width=True, hide_index=True)
+    else:
+        st.caption("Sin marcas registradas en el período.")
 
 
 # ── Módulo: Asistencia ────────────────────────────────────────────────────────
@@ -1231,7 +1457,8 @@ def page_asistencia():
 
     ET_ENT, ET_SAL = "⬆️ Registrar entrada", "⬇️ Registrar salida"
     ET_HIS, ET_AUS = "📊 Historial", "❌ Marcar ausencia"
-    etiquetas = [ET_ENT, ET_SAL, ET_HIS] + ([ET_AUS] if admin else [])
+    ET_DUP = "🧹 Registros duplicados"
+    etiquetas = [ET_ENT, ET_SAL, ET_HIS] + ([ET_AUS, ET_DUP] if admin else [])
 
     df_emp = sm.get_empleados()
     hoy_str = hoy().strftime("%Y-%m-%d")
@@ -1263,6 +1490,7 @@ def page_asistencia():
     tab2 = _Nada(seccion == ET_SAL)
     tab3 = _Nada(seccion == ET_HIS)
     tab4 = _Nada(seccion == ET_AUS) if admin else None
+    tab5 = _Nada(seccion == ET_DUP) if admin else None
 
     # Filtrar empleados según rol
     if not admin and usuario:
@@ -1287,8 +1515,21 @@ def page_asistencia():
             else:
                 emp_id, nombre = list(opciones.values())[0]
                 st.info(f"👤 Registrando asistencia para: **{nombre}**")
-            if sm.ya_registro_entrada(emp_id, hoy_str):
-                st.success(f"✅ {nombre} ya tiene su entrada registrada hoy.")
+            # Estado real, leído sin caché: es lo único que evita que alguien
+            # que abre el aplicativo por segunda vez vuelva a marcar entrada.
+            jornada = sm.entrada_de(emp_id, hoy_str, usar_cache=False)
+            if jornada:
+                st.success(f"✅ {nombre} ya marcó su entrada hoy a las "
+                           f"**{jornada['entrada']}**"
+                           + (f" · salida **{jornada['salida']}**" if jornada["salida"]
+                              else " · falta marcar la salida") + ".")
+                if jornada.get("duplicadas", 1) > 1:
+                    st.warning(f"⚠️ Hay {jornada['duplicadas']} registros de hoy para esta "
+                               "persona. Avísale a RRHH para que deje uno solo: "
+                               "Asistencia → Registros duplicados.")
+                if not jornada["salida"]:
+                    st.info("¿Vienes a marcar tu salida? Cambia a la sección "
+                            "«⬇️ Registrar salida» de arriba.")
             else:
                 # La hora ya no se escribe a mano: se toma del reloj en el
                 # instante del clic, para que el registro no sea manipulable.
@@ -1317,7 +1558,8 @@ def page_asistencia():
                     momento = ahora()
                     with st.spinner("Registrando…"):
                         estado, atraso = sm.registrar_entrada(
-                            emp_id, nombre, momento.strftime("%H:%M"), config)
+                            emp_id, nombre, momento.strftime("%H:%M"), config,
+                            tipo_dispositivo())
                     if estado == "Tardanza":
                         flash("warning", f"⏰ Entrada de **{nombre}** registrada a las "
                                          f"{momento.strftime('%H:%M')} — "
@@ -1354,7 +1596,8 @@ def page_asistencia():
                 try:
                     with st.spinner("Registrando…"):
                         ev = sm.registrar_salida(emp_id, hoy_str,
-                                                 momento.strftime("%H:%M"), obs, config)
+                                                 momento.strftime("%H:%M"), obs, config,
+                                                 tipo_dispositivo())
                     # Explícito: la sección se conserva para que nadie lea la
                     # recarga como si le hubieran registrado una entrada.
                     st.session_state["sec_asistencia"] = ET_SAL
@@ -1389,6 +1632,59 @@ def page_asistencia():
             if st.button("📨 Revisar y avisar", key="btn_rev_salidas"):
                 with st.spinner("Revisando…"):
                     revisar_salidas_pendientes(sm, config, int(dias_rev), mostrar=True)
+
+    if tab5 is not None and tab5.activo:
+        st.subheader("Registros duplicados de entrada")
+        st.caption("Días en que una misma persona quedó con más de un registro. Cada "
+                   "duplicado cuenta un atraso de más en su expediente y deja la salida "
+                   "escrita sobre uno solo de los dos. Se conserva la PRIMERA marca del "
+                   "día, que es la real.")
+        dias_dup = st.number_input("Días hacia atrás a revisar", min_value=1,
+                                   max_value=365, value=60, step=15,
+                                   key="dias_duplicados",
+                                   help="Cuántos días revisar en busca de duplicados.")
+        try:
+            dups = sm.entradas_duplicadas(int(dias_dup))
+        except Exception as e:
+            dups = []
+            st.error(f"No se pudo revisar: {type(e).__name__}: {e}")
+        if not dups:
+            st.success("✅ No hay registros duplicados en el período revisado.")
+        else:
+            st.warning(f"⚠️ {len(dups)} día(s) con registro duplicado.")
+            st.dataframe(tabla_segura(pd.DataFrame(
+                [{"Fecha": d["fecha"], "ID": d["id_empleado"], "Nombre": d["nombre"],
+                  "Registros": d["n"],
+                  "Horas": " / ".join(f["entrada"] or "—" for f in d["filas"]),
+                  "Dispositivos": " / ".join(f["dispositivo"] or "—" for f in d["filas"]),
+                  "Atrasos contados": sum(f["atraso"] for f in d["filas"])}
+                 for d in dups])), use_container_width=True, hide_index=True)
+            st.divider()
+            for d in dups[:25]:
+                with st.expander(f"{d['fecha']} · {d['nombre']} · {d['n']} registros"):
+                    for f_ in d["filas"]:
+                        marca = "✅ se conserva" if f_["fila"] == d["conservar"] else "🗑️ sobra"
+                        st.write(f"{marca} · fila {f_['fila']} · entrada "
+                                 f"**{f_['entrada'] or '—'}** · salida "
+                                 f"{f_['salida'] or '—'} · {f_['estado']} · "
+                                 f"{int(f_['atraso'])} min de atraso · "
+                                 f"{f_['dispositivo'] or 'dispositivo no registrado'}")
+                    if st.button(f"🧹 Dejar solo la primera marca",
+                                 key=f"limpiar_{d['fecha']}_{d['id_empleado']}"):
+                        errores = []
+                        for fila_n in d["sobrantes"]:
+                            try:
+                                sm.limpiar_entrada_duplicada(fila_n)
+                            except Exception as e:
+                                errores.append(f"fila {fila_n}: {e}")
+                        if errores:
+                            flash("warning", "No se pudieron limpiar todas: " + " · ".join(errores))
+                        else:
+                            flash("success", f"✅ {d['nombre']}, {d['fecha']}: quedó un "
+                                             f"solo registro, el de las "
+                                             f"{d['filas'][0]['entrada']}.")
+                        st.session_state["sec_asistencia"] = ET_DUP
+                        st.rerun()
 
     if tab3.activo:
         st.subheader("Historial de asistencia")
@@ -4086,6 +4382,7 @@ def main():
             "Dashboard":         page_dashboard,
             "Empleados":         page_empleados,
             "Asistencia":        page_asistencia,
+            "Panel Semanal":     page_panel_semanal,
             "Permisos":          _page_permisos_con_rol,
             "Vacaciones":        _page_vacaciones_con_rol,
             "Horas Extras":      _page_horas_extras_con_rol,
